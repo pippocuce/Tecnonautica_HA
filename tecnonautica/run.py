@@ -74,6 +74,26 @@ def send_direct(frame, timeout=0.8):
 def board_display_name(board_id, board_info):
     return BOARD_NAMES.get(board_id, board_info["name"])
 
+def read_relay_config(mm, aa, board_id):
+    """Legge la configurazione CO (TOGGLE/BURST) di ogni relè TN267"""
+    frame = build_frame("Q", mm, aa, "CO")
+    resp = send_direct(frame, timeout=0.5)
+    
+    config = {}
+    if resp and "CO" in resp:
+        try:
+            idx = resp.find("CO") + 2
+            stati = resp[idx:idx+6]  # 6 caratteri per 6 relè
+            for i, s in enumerate(stati):
+                relay_num = i + 1
+                mode = "burst" if s == "B" else "toggle" if s == "T" else "unknown"
+                config[relay_num] = mode
+                print(f"    Relè {relay_num}: {mode.upper()}", flush=True)
+        except Exception as e:
+            print(f"    Errore lettura CO: {e}", flush=True)
+    
+    return config
+
 def publish_relay_state(board_id, relay_num, stato):
     """Pubblica stato relè (simile a switch)"""
     topic = f"tecnonautica/{board_id}/relè{relay_num}/state"
@@ -123,7 +143,7 @@ def load_boards():
 
 # ─────────────────────────────────────────
 # DISCOVERY
-# ─────���───────────────────────────────────
+# ─────────────────────────────────────────
 def scan_bus():
     print("\n=== SCANSIONE BUS TECNONAUTICA ===", flush=True)
     found = {}
@@ -134,13 +154,21 @@ def scan_bus():
             resp = send_direct(frame, timeout=0.3)
             if resp and "ID" in resp and mm in resp:
                 board_id = f"{mm}_{aa}"
-                found[board_id] = {
+                board_data = {
                     "machine":  mm,
                     "address":  aa,
                     "type":     info["type"],
                     "name":     f"{info['name']} addr={aa}",
                     "model":    info["name"],
                 }
+                
+                # Se è una TN267 (hybrid), leggi la configurazione dei relè
+                if mm == "PM":
+                    print(f"  Lettura configurazione relè TN267 {aa}...", flush=True)
+                    relay_config = read_relay_config(mm, aa, board_id)
+                    board_data["relay_config"] = relay_config
+                
+                found[board_id] = board_data
                 print(f"  ✓ Trovata {info['name']} indirizzo {aa}", flush=True)
             time.sleep(0.05)
     if not found:
@@ -148,27 +176,51 @@ def scan_bus():
     print("=== FINE SCANSIONE ===\n", flush=True)
     return found
 
-# ───────────────────────��─────────────────
+# ─────────────────────────────────────────
 # DISCOVERY MQTT - TN267 (HYBRID)
 # ─────────────────────────────────────────
 def publish_discovery_relay(board_id, board_info, relay_num):
-    """TN267: relè come switch"""
+    """TN267: relè come switch o button dipende dalla config"""
+    relay_config = board_info.get("relay_config", {})
+    relay_mode = relay_config.get(relay_num, "toggle")
+    
     uid  = f"tecnonautica_{board_id}_relay{relay_num}"
     name = f"{board_display_name(board_id, board_info)} Relè {relay_num}"
-    payload = json.dumps({
-        "name": name, "unique_id": uid,
-        "state_topic":   f"tecnonautica/{board_id}/relè{relay_num}/state",
-        "command_topic": f"tecnonautica/{board_id}/relè{relay_num}/set",
-        "payload_on": "ON", "payload_off": "OFF",
-        "retain": True, "optimistic": False,
-        "device": {
-            "identifiers": [f"tecnonautica_{board_id}"],
-            "name": board_display_name(board_id, board_info),
-            "model": board_info["model"],
-            "manufacturer": "Tecnonautica"
-        }
-    })
-    mqtt_client.publish(f"homeassistant/switch/{uid}/config", payload, retain=True)
+    
+    # Se è in modalità BURST (momentaneo), usa un BUTTON, altrimenti SWITCH
+    if relay_mode == "burst":
+        # Modalità momentanea: BUTTON (pulsante)
+        payload = json.dumps({
+            "name": name, "unique_id": uid,
+            "command_topic": f"tecnonautica/{board_id}/relè{relay_num}/set",
+            "payload_press": "PULSE",
+            "device": {
+                "identifiers": [f"tecnonautica_{board_id}"],
+                "name": board_display_name(board_id, board_info),
+                "model": board_info["model"],
+                "manufacturer": "Tecnonautica"
+            }
+        })
+        mqtt_client.publish(f"homeassistant/button/{uid}/config", payload, retain=True)
+        print(f"    💨 Relè {relay_num} configurato come BUTTON (momentaneo)", flush=True)
+    
+    else:
+        # Modalità toggle/switch: SWITCH (interruttore)
+        payload = json.dumps({
+            "name": name, "unique_id": uid,
+            "state_topic":   f"tecnonautica/{board_id}/relè{relay_num}/state",
+            "command_topic": f"tecnonautica/{board_id}/relè{relay_num}/set",
+            "payload_on": "ON", "payload_off": "OFF",
+            "retain": True, "optimistic": False,
+            "device": {
+                "identifiers": [f"tecnonautica_{board_id}"],
+                "name": board_display_name(board_id, board_info),
+                "model": board_info["model"],
+                "manufacturer": "Tecnonautica"
+            }
+        })
+        mqtt_client.publish(f"homeassistant/switch/{uid}/config", payload, retain=True)
+        print(f"    🔘 Relè {relay_num} configurato come SWITCH (toggle)", flush=True)
 
 def publish_discovery_button(board_id, board_info, btn_num):
     """TN267: pulsanti come binary sensor"""
@@ -356,7 +408,7 @@ def setup_boards(boards):
                 sensor_values[sensor_key] = "0"
                 publish_discovery_sensor(board_id, info, ch)
             
-            # 6 relè (controllabili)
+            # 6 relè (controllabili con config dinamica)
             for relay_num in range(1, 7):
                 relay_key = f"{board_id}_relay_{relay_num}"
                 channel_states[relay_key] = False
@@ -467,7 +519,7 @@ def parse_frame(msg):
     if time.time() - last_command_time < 1.0:
         return
 
-    # ────────────────────��────────────────────
+    # ─────────────────────────────────────────
     # ST - Channel Status (Switch, Light, TN267 Relays)
     # ─────────────────────────────────────────
     if "ST" in msg:
@@ -715,7 +767,7 @@ def heartbeat_thread():
                 break
             time.sleep(0.1)
 
-# ─────────────────────────────────────────
+# ────────────────��────────────────────────
 # MQTT
 # ─────────────────────────────────────────
 def on_connect(client, userdata, flags, rc):
@@ -762,7 +814,7 @@ def on_message(client, userdata, msg):
         # ─────────────────────────────────────────
         # Comando TN234 (Allarmi)
         # ─────────────────────────────────────────
-        if board_type == "alarm" and parts[2] == "cmd":
+        if board_type == "alarm" and len(parts) > 2 and parts[2] == "cmd":
             last_command_time = time.time()
             tx_queue.put(build_frame("S", mm, aa, payload))
             return
@@ -770,26 +822,38 @@ def on_message(client, userdata, msg):
         # ─────────────────────────────────────────
         # Comando TN267 Relè
         # ─────────────────────────────────────────
-        if board_type == "hybrid" and "relè" in parts[2]:
+        if board_type == "hybrid" and len(parts) > 2 and "relè" in parts[2]:
             relay_num = int(parts[2].replace("relè", ""))
+            relay_config = info.get("relay_config", {})
+            relay_mode = relay_config.get(relay_num, "toggle")
+            
             key = f"{board_id}_relay_{relay_num}"
             stato_attuale = channel_states.get(key, False)
-            vuole_on = (payload == "ON")
             
-            if vuole_on != stato_attuale:
-                channel_states[key] = vuole_on
-                publish_relay_state(board_id, relay_num, vuole_on)
-                last_command_time = time.time()
-                # Comando toggle relè: P1, P2, ..., P6
-                tx_queue.put(build_frame("S", mm, aa, f"P{relay_num}"))
-            else:
-                print(f"  {board_id}/relè{relay_num} già {payload}", flush=True)
+            print(f"  🔌 Relè {relay_num} ({relay_mode}): {payload}", flush=True)
+            
+            last_command_time = time.time()
+            frame = build_frame("S", mm, aa, f"P{relay_num}")
+            print(f"  📤 TX: {frame}", flush=True)
+            tx_queue.put(frame)
+            
+            # Se è TOGGLE, aggiorna lo stato locale
+            if relay_mode == "toggle":
+                vuole_on = (payload == "ON")
+                if vuole_on != stato_attuale:
+                    channel_states[key] = vuole_on
+                    publish_relay_state(board_id, relay_num, vuole_on)
+            
+            # Se è BURST, non preoccuparti dello stato (è solo un impulso)
+            elif relay_mode == "burst":
+                print(f"    💨 Impulso momentaneo inviato", flush=True)
+            
             return
         
         # ─────────────────────────────────────────
         # Comando Switch / Light / Warning
         # ─────────────────────────────────────────
-        if "canale" in parts[2]:
+        if len(parts) > 2 and "canale" in parts[2]:
             ch = int(parts[2].replace("canale", ""))
             key = f"{board_id}_{ch}"
             stato_attuale = channel_states.get(key, False)
