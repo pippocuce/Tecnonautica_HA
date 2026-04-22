@@ -39,6 +39,7 @@ last_command_time  = 0
 enable_commands_at = time.time() + 9999
 tx_queue           = queue.Queue()
 mqtt_ready         = threading.Event()
+serial_lock        = threading.Lock()  # ← AGGIUNGI QUESTO
 
 print(f"Apertura porta {PORT}...", flush=True)
 ser = serial.Serial(PORT, BAUD, timeout=0.1)
@@ -56,19 +57,27 @@ def build_frame(msg_type, machine, addr, data):
     return f"[{body}*{cs}]"
 
 def send_direct(frame, timeout=0.8):
-    ser.reset_input_buffer()
-    ser.write(frame.encode('ascii'))
-    buffer = ""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        data = ser.read(64)
-        if data:
-            buffer += data.decode('ascii', errors='replace')
-            if '[' in buffer and ']' in buffer:
-                start = buffer.find('[')
-                end   = buffer.find(']', start)
-                if end != -1:
-                    return buffer[start:end+1]
+    """Invia un frame e attende la risposta (thread-safe)"""
+    with serial_lock:  # ← LOCK ACQUISITO QUI
+        try:
+            ser.reset_input_buffer()
+            ser.write(frame.encode('ascii'))
+            buffer = ""
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                data = ser.read(64)
+                if data:
+                    buffer += data.decode('ascii', errors='replace')
+                    if '[' in buffer and ']' in buffer:
+                        start = buffer.find('[')
+                        end   = buffer.find(']', start)
+                        if end != -1:
+                            return buffer[start:end+1]
+                time.sleep(0.01)
+        except serial.SerialException as e:
+            print(f"  ⚠️ send_direct errore: {e}", flush=True)
+        except Exception as e:
+            print(f"  ⚠️ send_direct errore generico: {e}", flush=True)
     return None
 
 def board_display_name(board_id, board_info):
@@ -479,7 +488,8 @@ def tx_thread():
     while running:
         try:
             frame = tx_queue.get(timeout=0.1)
-            ser.write(frame.encode('ascii'))
+            with serial_lock:  # ← LOCK ACQUISITO QUI
+                ser.write(frame.encode('ascii'))
             print(f"TX: {frame}", flush=True)
             tx_queue.task_done()
             time.sleep(0.05)
@@ -495,7 +505,9 @@ def rx_thread():
     buffer = ""
     while running:
         try:
-            data = ser.read(64)
+            with serial_lock:  # ← LOCK ACQUISITO QUI
+                data = ser.read(64)
+            
             if data:
                 buffer += data.decode('ascii', errors='replace')
                 while '[' in buffer and ']' in buffer:
@@ -592,7 +604,7 @@ def parse_frame(msg):
                 print(f"  Parse ST errore: {e}", flush=True)
             break
 
-    # ─────────────────────────────────────────
+    # ────────���────────────────────────────────
     # KB - Keyboard Status (TN267 Buttons)
     # ─────────────────────────────────────────
     if "KB" in msg:
@@ -767,7 +779,7 @@ def heartbeat_thread():
                 break
             time.sleep(0.1)
 
-# ────────────────��────────────────────────
+# ─────────────────────────────────────────
 # MQTT
 # ─────────────────────────────────────────
 def on_connect(client, userdata, flags, rc):
