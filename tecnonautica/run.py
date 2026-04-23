@@ -622,39 +622,26 @@ def parse_frame(msg):
                 print(f"  Parse KB errore: {e}", flush=True)
             break
 
-    # ─────────────────────────────────────────
+        # ─────────────────────────────────────────
     # ME - Analog Sensors (TN267)
     # ─────────────────────────────────────────
     if "ME" in msg:
         for board_id, info in detected_boards.items():
             if info.get("type") != "hybrid":
                 continue
-            
-            mm = info["machine"]
-            aa = info["address"]
-            
-            if mm not in msg or aa not in msg:
-                continue
-            
-            try:
-                # A+00231B+89990
-                if "A+" in msg or "A-" in msg:
-                    idx = msg.find("A+") if "A+" in msg else msg.find("A-")
-                    val = msg[idx+1:idx+7].strip()
-                    sensor_key = f"{board_id}_sensor_1"
-                    sensor_values[sensor_key] = val
-                    publish_sensor_value(board_id, 1, val)
-                
-                if "B+" in msg or "B-" in msg:
-                    idx = msg.find("B+") if "B+" in msg else msg.find("B-")
-                    val = msg[idx+1:idx+7].strip()
-                    sensor_key = f"{board_id}_sensor_2"
-                    sensor_values[sensor_key] = val
-                    publish_sensor_value(board_id, 2, val)
-            
-            except Exception as e:
-                print(f"  Parse ME errore: {e}", flush=True)
-            break
+            if info["machine"] in msg and info["address"] in msg:
+                try:
+                    if "A+" in msg or "A-" in msg:
+                        idx = msg.find("A+") if "A+" in msg else msg.find("A-")
+                        val = msg[idx+1:idx+7].strip()
+                        publish_sensor_value(board_id, 1, val)
+                    if "B+" in msg or "B-" in msg:
+                        idx = msg.find("B+") if "B+" in msg else msg.find("B-")
+                        val = msg[idx+1:idx+7].strip()
+                        publish_sensor_value(board_id, 2, val)
+                except Exception as e:
+                    print(f"  Parse ME errore: {e}", flush=True)
+                break
 
     # ─────────────────────────────────────────
     # AS - Alarm Status (TN234)
