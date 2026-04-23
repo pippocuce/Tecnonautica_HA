@@ -39,7 +39,6 @@ last_command_time  = 0
 enable_commands_at = time.time() + 9999
 tx_queue           = queue.Queue()
 mqtt_ready         = threading.Event()
-serial_lock        = threading.Lock()  # ← AGGIUNGI QUESTO
 
 print(f"Apertura porta {PORT}...", flush=True)
 ser = serial.Serial(PORT, BAUD, timeout=0.1)
@@ -57,27 +56,19 @@ def build_frame(msg_type, machine, addr, data):
     return f"[{body}*{cs}]"
 
 def send_direct(frame, timeout=0.8):
-    """Invia un frame e attende la risposta (thread-safe)"""
-    with serial_lock:  # ← LOCK ACQUISITO QUI
-        try:
-            ser.reset_input_buffer()
-            ser.write(frame.encode('ascii'))
-            buffer = ""
-            deadline = time.time() + timeout
-            while time.time() < deadline:
-                data = ser.read(64)
-                if data:
-                    buffer += data.decode('ascii', errors='replace')
-                    if '[' in buffer and ']' in buffer:
-                        start = buffer.find('[')
-                        end   = buffer.find(']', start)
-                        if end != -1:
-                            return buffer[start:end+1]
-                time.sleep(0.01)
-        except serial.SerialException as e:
-            print(f"  ⚠️ send_direct errore: {e}", flush=True)
-        except Exception as e:
-            print(f"  ⚠️ send_direct errore generico: {e}", flush=True)
+    ser.reset_input_buffer()
+    ser.write(frame.encode('ascii'))
+    buffer = ""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        data = ser.read(64)
+        if data:
+            buffer += data.decode('ascii', errors='replace')
+            if '[' in buffer and ']' in buffer:
+                start = buffer.find('[')
+                end   = buffer.find(']', start)
+                if end != -1:
+                    return buffer[start:end+1]
     return None
 
 def board_display_name(board_id, board_info):
@@ -488,8 +479,7 @@ def tx_thread():
     while running:
         try:
             frame = tx_queue.get(timeout=0.1)
-            with serial_lock:  # ← LOCK ACQUISITO QUI
-                ser.write(frame.encode('ascii'))
+            ser.write(frame.encode('ascii'))
             print(f"TX: {frame}", flush=True)
             tx_queue.task_done()
             time.sleep(0.05)
@@ -505,9 +495,7 @@ def rx_thread():
     buffer = ""
     while running:
         try:
-            with serial_lock:  # ← LOCK ACQUISITO QUI
-                data = ser.read(64)
-            
+            data = ser.read(64)
             if data:
                 buffer += data.decode('ascii', errors='replace')
                 while '[' in buffer and ']' in buffer:
@@ -604,7 +592,7 @@ def parse_frame(msg):
                 print(f"  Parse ST errore: {e}", flush=True)
             break
 
-    # ────────���────────────────────────────────
+    # ─────────────────────────────────────────
     # KB - Keyboard Status (TN267 Buttons)
     # ─────────────────────────────────────────
     if "KB" in msg:
@@ -732,9 +720,9 @@ def heartbeat_thread():
     print("Heartbeat avviato.", flush=True)
     
     while running:
-        time.sleep(1)
+        time.sleep(0.5)  # ← Veloce
         
-        if time.time() - last_command_time < 2:
+        if time.time() - last_command_time < 1:  # ← Ridotto
             continue
         if not tx_queue.empty():
             continue
@@ -745,7 +733,7 @@ def heartbeat_thread():
         cs = checksum(body)
         tx_queue.put(f"[{body}*{cs}]")
         ping_counter = (ping_counter + 1) % 100
-        time.sleep(0.2)
+        time.sleep(0.1)  # ← Ridotto
         
         # QUERY su tutte le schede
         for board_id, info in detected_boards.items():
@@ -760,7 +748,6 @@ def heartbeat_thread():
                 tx_queue.put(build_frame("Q", mm, aa, "LS"))
             
             elif board_type == "hybrid":
-                # TN267: query per sensori, relè, e pulsanti
                 tx_queue.put(build_frame("Q", mm, aa, "ME"))
                 tx_queue.put(build_frame("Q", mm, aa, "ST"))
                 tx_queue.put(build_frame("Q", mm, aa, "KB"))
@@ -772,9 +759,9 @@ def heartbeat_thread():
             elif board_type == "warning":
                 tx_queue.put(build_frame("Q", mm, aa, "ST"))
             
-            time.sleep(0.1)
+            time.sleep(0.05)  # ← Ridotto
         
-        for _ in range(50):
+        for _ in range(20):  # ← Ridotto a 2 secondi
             if not running:
                 break
             time.sleep(0.1)
