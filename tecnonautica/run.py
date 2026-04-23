@@ -421,22 +421,31 @@ def parse_frame(msg):
     if time.time() - last_command_time < 1.0:
         return
 
-    # Risposta ST — switch/light/TN267 relè
-    if "ST" in msg:
+       # Risposta ME — sensori analogici TN267
+    if "ME" in msg:
         for board_id, info in detected_boards.items():
-            if info["type"] not in ["switch", "light", "hybrid"]:
+            if info["type"] != "hybrid":
                 continue
-            mm = info["machine"]
-            aa = info["address"]
-            if mm in msg and aa in msg:
+            if info["machine"] in msg and info["address"] in msg:
                 try:
-                    idx = msg.find("ST") + 2
-                    stati = ""
-                    for c in msg[idx:]:
-                        if c in "01":
-                            stati += c
-                        elif c in "K*]":
+                    # Formato: A+xxxxxB+yyyyy
+                    # Estrai valore A (sensore 1)
+                    for prefix_a in ["A+", "A-"]:
+                        if prefix_a in msg:
+                            idx = msg.find(prefix_a)
+                            val = msg[idx:idx+7].strip()
+                            publish_sensor_value(board_id, 1, val)
                             break
+                    # Estrai valore B (sensore 2)
+                    for prefix_b in ["B+", "B-"]:
+                        if prefix_b in msg:
+                            idx = msg.find(prefix_b)
+                            val = msg[idx:idx+7].strip()
+                            publish_sensor_value(board_id, 2, val)
+                            break
+                except Exception as e:
+                    print(f"  Parse ME errore: {e}", flush=True)
+                break
                     
                     # TN267 relè (6 canali)
                     if info["type"] == "hybrid" and len(stati) == 6:
