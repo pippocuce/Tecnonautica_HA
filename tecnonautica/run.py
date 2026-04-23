@@ -24,7 +24,7 @@ SCAN_TOPIC  = "tecnonautica/scan"
 MACHINE_TYPES = {
     "T2": {"name": "TN218",  "channels": 6,  "type": "switch"},
     "T1": {"name": "TN222",  "channels": 10, "type": "switch"},
-    "PM": {"name": "TN267",  "channels": 8,  "type": "hybrid"},  # ← 2 sensori + 6 relè
+    "PM": {"name": "TN267",  "channels": 8,  "type": "hybrid"},
     "AL": {"name": "TN234",  "channels": 16, "type": "alarm"},
     "SP": {"name": "TN223",  "channels": 10, "type": "switch"},
     "SL": {"name": "TN224",  "channels": 6,  "type": "light"},
@@ -100,7 +100,7 @@ def publish_sensor_value(board_id, ch_num, value):
 
 # ─────────────────────────────────────────
 # SALVATAGGIO / CARICAMENTO SCHEDE
-# ─────────────────────────────────────────
+# ───────────────────────────────────���─────
 def save_boards(boards):
     with open(BOARDS_FILE, "w") as f:
         json.dump(boards, f, indent=2)
@@ -421,31 +421,22 @@ def parse_frame(msg):
     if time.time() - last_command_time < 1.0:
         return
 
-       # Risposta ME — sensori analogici TN267
-    if "ME" in msg:
+    # Risposta ST — switch/light/TN267 relè
+    if "ST" in msg:
         for board_id, info in detected_boards.items():
-            if info["type"] != "hybrid":
+            if info["type"] not in ["switch", "light", "hybrid"]:
                 continue
-            if info["machine"] in msg and info["address"] in msg:
+            mm = info["machine"]
+            aa = info["address"]
+            if mm in msg and aa in msg:
                 try:
-                    # Formato: A+xxxxxB+yyyyy
-                    # Estrai valore A (sensore 1)
-                    for prefix_a in ["A+", "A-"]:
-                        if prefix_a in msg:
-                            idx = msg.find(prefix_a)
-                            val = msg[idx:idx+7].strip()
-                            publish_sensor_value(board_id, 1, val)
+                    idx = msg.find("ST") + 2
+                    stati = ""
+                    for c in msg[idx:]:
+                        if c in "01":
+                            stati += c
+                        elif c in "K*]":
                             break
-                    # Estrai valore B (sensore 2)
-                    for prefix_b in ["B+", "B-"]:
-                        if prefix_b in msg:
-                            idx = msg.find(prefix_b)
-                            val = msg[idx:idx+7].strip()
-                            publish_sensor_value(board_id, 2, val)
-                            break
-                except Exception as e:
-                    print(f"  Parse ME errore: {e}", flush=True)
-                break
                     
                     # TN267 relè (6 canali)
                     if info["type"] == "hybrid" and len(stati) == 6:
@@ -501,21 +492,28 @@ def parse_frame(msg):
                     print(f"  Parse LS errore: {e}", flush=True)
                 break
 
-    # Risposta ME — sensori analogici TN267
+    # Risposta ME — sensori analogici TN267 (CORRETTO)
     if "ME" in msg:
         for board_id, info in detected_boards.items():
             if info["type"] != "hybrid":
                 continue
             if info["machine"] in msg and info["address"] in msg:
                 try:
-                    if "A+" in msg or "A-" in msg:
-                        idx = msg.find("A+") if "A+" in msg else msg.find("A-")
-                        val = msg[idx+1:idx+7].strip()
-                        publish_sensor_value(board_id, 1, val)
-                    if "B+" in msg or "B-" in msg:
-                        idx = msg.find("B+") if "B+" in msg else msg.find("B-")
-                        val = msg[idx+1:idx+7].strip()
-                        publish_sensor_value(board_id, 2, val)
+                    # Formato: A+xxxxxB+yyyyy
+                    # Estrai valore A (sensore 1)
+                    for prefix_a in ["A+", "A-"]:
+                        if prefix_a in msg:
+                            idx = msg.find(prefix_a)
+                            val = msg[idx:idx+7].strip()
+                            publish_sensor_value(board_id, 1, val)
+                            break
+                    # Estrai valore B (sensore 2)
+                    for prefix_b in ["B+", "B-"]:
+                        if prefix_b in msg:
+                            idx = msg.find(prefix_b)
+                            val = msg[idx:idx+7].strip()
+                            publish_sensor_value(board_id, 2, val)
+                            break
                 except Exception as e:
                     print(f"  Parse ME errore: {e}", flush=True)
                 break
