@@ -476,9 +476,11 @@ def parse_frame(msg):
                     # Estrai valore A (sensore 1) - leggi SOLO i 5 caratteri dopo A+/-
                     for prefix_a in ["A+", "A-"]:
                         if prefix_a in msg:
-                            idx = msg.find(prefix_a) + 2  # Salta il prefisso
-                            val = msg[idx:idx+5].strip()   # Leggi 5 cifre
-                            publish_sensor_value(board_id, 1, val)
+                            idx = msg.find(prefix_a)
+                            raw = msg[idx:idx+7]
+                            val = ''.join(c for c in raw if c in '0123456789+-.')
+                            if val:
+                                publish_sensor_value(board_id, 1, val)
                             break
                     # Estrai valore B (sensore 2)
                     for prefix_b in ["B+", "B-"]:
