@@ -483,13 +483,13 @@ def parse_frame(msg):
                     # Estrai valore B (sensore 2)
                     for prefix_b in ["B+", "B-"]:
                         if prefix_b in msg:
-                            idx = msg.find(prefix_b) + 2  # Salta il prefisso
-                            val = msg[idx:idx+5].strip()   # Leggi 5 cifre
-                            publish_sensor_value(board_id, 2, val)
+                            idx = msg.find(prefix_b)
+                            # Estrai fino a KK o * escludendo caratteri non validi
+                            raw = msg[idx:idx+7]
+                            val = ''.join(c for c in raw if c in '0123456789+-.')
+                            if val:
+                                publish_sensor_value(board_id, 2, val)
                             break
-                except Exception as e:
-                    print(f"  Parse ME errore: {e}", flush=True)
-                break
 # ─────────────────────────────────────────
 # Thread Heartbeat
 # ─────────────────────────────────────────
