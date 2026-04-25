@@ -475,9 +475,9 @@ def parse_frame(msg):
                     for prefix_a in ["A+", "A-"]:
                         if prefix_a in msg:
                             idx = msg.find(prefix_a)
-                            raw = msg[idx:idx+10]
+                            raw = msg[idx:idx+7]
                             val = ''.join(c for c in raw if c in '0123456789+-.')
-                            val = val[:7]  # massimo 7 caratteri validi
+                            val = val[:6]  # massimo 7 caratteri validi
                             if val:
                                 publish_sensor_value(board_id, 1, val)
                             break
