@@ -475,16 +475,18 @@ def parse_frame(msg):
                     for prefix_a in ["A+", "A-"]:
                         if prefix_a in msg:
                             idx = msg.find(prefix_a)
-                            raw = msg[idx:idx+7]
+                            raw = msg[idx:idx+10]
                             val = ''.join(c for c in raw if c in '0123456789+-.')
+                            val = val[:7]  # massimo 7 caratteri validi
                             if val:
                                 publish_sensor_value(board_id, 1, val)
                             break
                     for prefix_b in ["B+", "B-"]:
                         if prefix_b in msg:
                             idx = msg.find(prefix_b)
-                            raw = msg[idx:idx+7]
+                            raw = msg[idx:idx+10]
                             val = ''.join(c for c in raw if c in '0123456789+-.')
+                            val = val[:7]  # massimo 7 caratteri validi
                             if val:
                                 publish_sensor_value(board_id, 2, val)
                             break
