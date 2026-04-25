@@ -472,7 +472,6 @@ def parse_frame(msg):
                 continue
             if info["machine"] in msg and info["address"] in msg:
                 try:
-                    # Formato: A+xxxxxB+yyyyy (segno + 5 cifre per ogni sensore)
                     # Estrai valore A (sensore 1) - leggi SOLO i 5 caratteri dopo A+/-
                     for prefix_a in ["A+", "A-"]:
                         if prefix_a in msg:
@@ -482,6 +481,9 @@ def parse_frame(msg):
                             if val:
                                 publish_sensor_value(board_id, 1, val)
                             break
+                except Exception as e:
+                    print(f"  Parse ME errore: {e}", flush=True)
+                break
                     # Estrai valore B (sensore 2)
                     for prefix_b in ["B+", "B-"]:
                         if prefix_b in msg:
@@ -491,7 +493,10 @@ def parse_frame(msg):
                             val = ''.join(c for c in raw if c in '0123456789+-.')
                             if val:
                                 publish_sensor_value(board_id, 2, val)
-                            break
+                           break
+                except Exception as e:
+                    print(f"  Parse ME errore: {e}", flush=True)
+                break
 # ─────────────────────────────────────────
 # Thread Heartbeat
 # ─────────────────────────────────────────
