@@ -465,14 +465,13 @@ def parse_frame(msg):
                     print(f"  Parse LS errore: {e}", flush=True)
                 break
 
-           # Risposta ME — sensori analogici TN267 (CORRETTO)
+           # Risposta ME — sensori analogici TN267/TN208
     if "ME" in msg:
         for board_id, info in detected_boards.items():
             if info["type"] != "hybrid":
                 continue
             if info["machine"] in msg and info["address"] in msg:
                 try:
-                    # Estrai valore A (sensore 1) - leggi SOLO i 5 caratteri dopo A+/-
                     for prefix_a in ["A+", "A-"]:
                         if prefix_a in msg:
                             idx = msg.find(prefix_a)
@@ -481,19 +480,14 @@ def parse_frame(msg):
                             if val:
                                 publish_sensor_value(board_id, 1, val)
                             break
-                except Exception as e:
-                    print(f"  Parse ME errore: {e}", flush=True)
-                break
-                    # Estrai valore B (sensore 2)
                     for prefix_b in ["B+", "B-"]:
                         if prefix_b in msg:
                             idx = msg.find(prefix_b)
-                            # Estrai fino a KK o * escludendo caratteri non validi
                             raw = msg[idx:idx+7]
                             val = ''.join(c for c in raw if c in '0123456789+-.')
                             if val:
                                 publish_sensor_value(board_id, 2, val)
-                           break
+                            break
                 except Exception as e:
                     print(f"  Parse ME errore: {e}", flush=True)
                 break
