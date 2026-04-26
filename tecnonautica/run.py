@@ -349,22 +349,22 @@ def do_scan():
     mqtt_client.publish(SCAN_TOPIC + "/result", f"Trovate {len(found)} schede", retain=False)
 
 # ─────────────────────────────────────────
-# THREAD TX
+# Thread TX
 # ─────────────────────────────────────────
 def tx_thread():
-    # Pausa standard fra un frame e l'altro (come l'originale)
+    # Pausa standard fra un frame e l'altro (come prima)
     TX_INTERFRAME_DELAY = 0.05
-    # Pausa più lunga dopo aver inviato una QUERY (Q ME, Q ST, Q AS, Q LS, Q ID),
-    # per dare alla scheda il tempo di rispondere e liberare il bus prima del
-    # frame successivo. Senza questa pausa il `Q ST` parte mentre la scheda sta
-    # ancora rispondendo al `Q ME` e i valori dei sensori arrivano corrotti.
+    # Pausa più lunga dopo l'invio di una QUERY (Q ME, Q ST, Q AS, Q LS, Q ID)
+    # per dare tempo alla scheda di rispondere e liberare il bus prima del
+    # frame successivo. Senza questa pausa il `Q ST` parte mentre la scheda
+    # sta ancora rispondendo al `Q ME` -> collisione -> valori sensori corrotti.
     TX_POST_QUERY_DELAY = 0.08
     while running:
         try:
             frame = tx_queue.get(timeout=0.1)
             if not scanning:
-                if serial_write(frame.encode("ascii")):
-                    log.debug(f"TX: {frame}")
+                ser.write(frame.encode('ascii'))
+                print(f"TX: {frame}", flush=True)
             tx_queue.task_done()
             # È una query? il secondo carattere del frame è 'Q' (es. "[QPM00MEKK*xx]")
             is_query = len(frame) > 1 and frame[1] == "Q"
@@ -372,7 +372,7 @@ def tx_thread():
         except queue.Empty:
             pass
         except Exception as e:
-            log.error(f"TX errore: {e}")
+            print(f"TX errore: {e}", flush=True)
 
 # ─────────────────────────────────────────
 # Thread RX
