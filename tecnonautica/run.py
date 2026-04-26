@@ -24,7 +24,7 @@ SCAN_TOPIC  = "tecnonautica/scan"
 MACHINE_TYPES = {
     "T2": {"name": "TN218",  "channels": 6,  "type": "switch"},
     "T1": {"name": "TN222",  "channels": 10, "type": "switch"},
-    "PM": {"name": "TN267",  "channels": 8,  "type": "hybrid"},
+    "PM": {"name": "TN267",  "channels": 6,  "type": "hybrid"},
     "AL": {"name": "TN234",  "channels": 16, "type": "alarm"},
     "SP": {"name": "TN223",  "channels": 10, "type": "switch"},
     "SL": {"name": "TN224",  "channels": 6,  "type": "light"},
@@ -102,10 +102,12 @@ def publish_sensor_value(board_id, ch_num, value):
     print(f"HA <- {board_id}/sensore{ch_num} = {value}", flush=True)
 
 def burst_loop(board_id, ch, mm, aa, stop_event):
-    """Manda P{ch} ogni 500ms finche stop_event non viene settato"""
-    frame = build_frame("S", mm, aa, f"P{ch}")
+    """Modalità burst conforme al protocollo Tecnonautica (par. 4.2/4.4):
+       - manda S{ch} (key STAY pressed) ogni 500 ms finché il tasto è premuto
+       - manda R{ch} (key release) al rilascio"""
+    stay_frame = build_frame("S", mm, aa, f"S{ch}")
     while not stop_event.is_set():
-        tx_queue.put(frame)
+        tx_queue.put(stay_frame)
         stop_event.wait(0.5)
     tx_queue.put(build_frame("S", mm, aa, f"R{ch}"))
     print(f"Burst stop {board_id}/canale{ch}", flush=True)
@@ -358,7 +360,8 @@ def tx_thread():
     # per dare tempo alla scheda di rispondere e liberare il bus prima del
     # frame successivo. Senza questa pausa il `Q ST` parte mentre la scheda
     # sta ancora rispondendo al `Q ME` -> collisione -> valori sensori corrotti.
-    TX_POST_QUERY_DELAY = 0.08
+    # 200 ms = sopra il minimo di 180 ms imposto dal protocollo (par. 2.1)
+    TX_POST_QUERY_DELAY = 0.20
     while running:
         try:
             frame = tx_queue.get(timeout=0.1)
