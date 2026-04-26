@@ -310,6 +310,8 @@ def setup_boards(boards):
     for board_id, info in boards.items():
         print(f"Setup {board_id} ({info['type']})...", flush=True)
         if info["type"] == "hybrid":
+            # Modalità di default: tutti TOGGLE finché la prima Q CO non risponde
+            info.setdefault("channel_modes", ["T"] * 6)
             for ch in range(1, 3):
                 publish_discovery_sensor(board_id, info, ch)
             for relay_num in range(1, 7):
@@ -477,7 +479,30 @@ def parse_frame(msg):
                     print(f"  Parse LS errore: {e}", flush=True)
                 break
 
-           # Risposta ME — sensori analogici TN267/TN208
+    # Risposta CO — configurazione canali TN267 (B=burst, T=toggle)
+    if "CO" in msg:
+        for board_id, info in detected_boards.items():
+            if info["type"] != "hybrid":
+                continue
+            if info["machine"] in msg and info["address"] in msg:
+                try:
+                    idx = msg.find("CO") + 2
+                    modes = ""
+                    for c in msg[idx:]:
+                        if c in "BT":
+                            modes += c
+                        elif c in "K*]":
+                            break
+                    if len(modes) == 6:
+                        new_modes = list(modes)
+                        if info.get("channel_modes") != new_modes:
+                            info["channel_modes"] = new_modes
+                            print(f"  {board_id} channel_modes = {modes}", flush=True)
+                except Exception as e:
+                    print(f"  Parse CO errore: {e}", flush=True)
+                break
+
+    # Risposta ME — sensori analogici TN267/TN208
     if "ME" in msg:
         for board_id, info in detected_boards.items():
             if info["type"] != "hybrid":
@@ -533,6 +558,8 @@ def heartbeat_thread():
             elif info["type"] == "hybrid":
                 tx_queue.put(build_frame("Q", info["machine"], info["address"], "ME"))
                 tx_queue.put(build_frame("Q", info["machine"], info["address"], "ST"))
+                # Q CO -> rileva i cambi fisici TOGGLE/BURST sui DIP della TN267
+                tx_queue.put(build_frame("Q", info["machine"], info["address"], "CO"))
             elif info["type"] == "sensor":
                 tx_queue.put(build_frame("Q", info["machine"], info["address"], "ME"))
             elif info["type"] == "alarm":
@@ -593,11 +620,33 @@ def on_message(client, userdata, msg):
             key = f"{board_id}_relay_{relay_num}"
             stato_attuale = channel_states.get(key, False)
             vuole_on = (payload == "ON")
+            ch_modes = info.get("channel_modes", ["T"] * 6)
+            mode = ch_modes[relay_num - 1] if relay_num - 1 < len(ch_modes) else "T"
+
             if vuole_on != stato_attuale:
                 channel_states[key] = vuole_on
                 publish_relay_state(board_id, relay_num, vuole_on)
                 last_command_time = time.time()
-                tx_queue.put(build_frame("S", mm, aa, f"P{relay_num}"))
+
+                if mode == "B":
+                    # Canale in modalità BURST: serve Sx ripetuto ogni 500 ms + Rx al rilascio
+                    burst_key = f"{board_id}_relay_{relay_num}"
+                    if vuole_on:
+                        stop_event = threading.Event()
+                        burst_active[burst_key] = stop_event
+                        threading.Thread(
+                            target=burst_loop,
+                            args=(board_id, relay_num, mm, aa, stop_event),
+                            daemon=True
+                        ).start()
+                        print(f"Burst start {board_id}/rele{relay_num}", flush=True)
+                    else:
+                        if burst_key in burst_active:
+                            burst_active[burst_key].set()
+                            del burst_active[burst_key]
+                else:
+                    # Canale in modalità TOGGLE: singolo Px
+                    tx_queue.put(build_frame("S", mm, aa, f"P{relay_num}"))
             else:
                 print(f"  {board_id}/rele{relay_num} già {payload}", flush=True)
             return
