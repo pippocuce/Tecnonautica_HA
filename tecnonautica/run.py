@@ -55,8 +55,7 @@ scanning            = False
 channel_states      = {}
 last_command_time   = 0.0
 enable_commands_at  = time.time() + 9999
-tx_queue            = queue.Queue(maxsize=200)   # query / heartbeat
-priority_tx_queue   = queue.Queue()               # comandi utente (precedenza assoluta)
+tx_queue            = queue.Queue(maxsize=200)
 mqtt_ready          = threading.Event()
 burst_active        = {}
 state_lock          = threading.Lock()        # protegge detected_boards / channel_states
@@ -67,13 +66,6 @@ published_discovery = set()                   # uid già pubblicati (per cleanup
 COMMAND_ECHO_WINDOW = 0.25
 # Soglia oltre la quale heartbeat smette di accodare
 TX_QUEUE_HIGH = 50
-# Pausa fra frame TX (s) — minima per non saturare RS485 a 19200 baud
-TX_INTERFRAME_DELAY = 0.015
-# Pausa extra dopo l'invio di una query (Q…) per lasciare alla scheda il tempo
-# di rispondere e liberare il bus prima del prossimo TX. Evita collisioni.
-TX_POST_QUERY_DELAY = 0.08
-# Polling della coda normale: tenuto basso così i frame prioritari partono subito
-TX_QUEUE_POLL = 0.02
 
 # ─────────────────────────────────────────
 # PORTA SERIALE (con riapertura automatica)
@@ -207,16 +199,16 @@ def publish_sensor_value(board_id, ch_num, value):
 # ─────────────────────────────────────────
 def burst_loop(board_id, ch, mm, aa, stop_event):
     frame = build_frame("S", mm, aa, f"P{ch}")
-    # Primo frame in priorità per attivare subito il canale
-    priority_tx_queue.put(frame)
-    stop_event.wait(0.5)
     while not stop_event.is_set():
         try:
             tx_queue.put(frame, timeout=1.0)
         except queue.Full:
             log.warning("TX queue piena, salto frame burst")
         stop_event.wait(0.5)
-    priority_tx_queue.put(build_frame("S", mm, aa, f"R{ch}"))
+    try:
+        tx_queue.put(build_frame("S", mm, aa, f"R{ch}"), timeout=1.0)
+    except queue.Full:
+        pass
     log.info(f"Burst stop {board_id}/canale{ch}")
 
 # ─────────────────────────────────────────
@@ -474,61 +466,27 @@ def do_scan():
 # THREAD TX
 # ─────────────────────────────────────────
 def tx_thread():
+    # Pausa standard fra un frame e l'altro (come l'originale)
+    TX_INTERFRAME_DELAY = 0.05
+    # Pausa più lunga dopo aver inviato una QUERY (Q ME, Q ST, Q AS, Q LS, Q ID),
+    # per dare alla scheda il tempo di rispondere e liberare il bus prima del
+    # frame successivo. Senza questa pausa il `Q ST` parte mentre la scheda sta
+    # ancora rispondendo al `Q ME` e i valori dei sensori arrivano corrotti.
+    TX_POST_QUERY_DELAY = 0.08
     while running:
-        frame = None
-        from_priority = False
-        # 1) Prima sempre la coda prioritaria (comandi utente)
         try:
-            frame = priority_tx_queue.get_nowait()
-            from_priority = True
-        except queue.Empty:
-            # 2) Altrimenti la coda normale (heartbeat / query)
-            #    Polling breve così un eventuale comando prioritario in arrivo
-            #    parte entro TX_QUEUE_POLL (~20 ms) invece di 100 ms.
-            try:
-                frame = tx_queue.get(timeout=TX_QUEUE_POLL)
-            except queue.Empty:
-                continue
-            # Doppio check: se nel frattempo è arrivato un priority,
-            # rimanda il frame heartbeat in coda e processa il priority.
-            try:
-                pframe = priority_tx_queue.get_nowait()
-                tx_queue.put_nowait(frame)
-                frame = pframe
-                from_priority = True
-            except queue.Empty:
-                pass
-            except queue.Full:
-                pass
-
-        try:
+            frame = tx_queue.get(timeout=0.1)
             if not scanning:
                 if serial_write(frame.encode("ascii")):
-                    log.debug(f"TX{'!' if from_priority else ''}: {frame}")
-            if from_priority:
-                priority_tx_queue.task_done()
-            else:
-                tx_queue.task_done()
-            # Se era una query (frame del tipo "[Q…"), aspetta più a lungo
-            # per dare tempo alla scheda di rispondere e liberare il bus.
+                    log.debug(f"TX: {frame}")
+            tx_queue.task_done()
+            # È una query? il secondo carattere del frame è 'Q' (es. "[QPM00MEKK*xx]")
             is_query = len(frame) > 1 and frame[1] == "Q"
             time.sleep(TX_POST_QUERY_DELAY if is_query else TX_INTERFRAME_DELAY)
+        except queue.Empty:
+            pass
         except Exception as e:
             log.error(f"TX errore: {e}")
-
-def drain_heartbeat_queue():
-    """Svuota la coda normale: usato quando arriva un comando utente
-       per evitare che frame heartbeat già accodati ritardino il relè."""
-    dropped = 0
-    while True:
-        try:
-            tx_queue.get_nowait()
-            tx_queue.task_done()
-            dropped += 1
-        except queue.Empty:
-            break
-    if dropped:
-        log.debug(f"Drain heartbeat: {dropped} frame scartati")
 
 # ─────────────────────────────────────────
 # THREAD RX
@@ -670,26 +628,17 @@ def parse_frame(msg):
 # THREAD HEARTBEAT
 # ─────────────────────────────────────────
 def heartbeat_thread():
-    """Polling periodico delle schede.
-       - Si ferma per HEARTBEAT_BLOCK_AFTER_CMD secondi dopo un comando utente.
-       - Cicla ogni HEARTBEAT_PERIOD secondi quando il bus è libero."""
-    HEARTBEAT_PERIOD          = 5.0   # ciclo completo (s)
-    HEARTBEAT_BLOCK_AFTER_CMD = 3.0   # silenzio dopo un comando utente (s)
-    INTRA_QUERY_DELAY         = 0.05  # pausa tra query consecutive
     ping_counter = 0
     mqtt_ready.wait()
     time.sleep(2)
     log.info("Heartbeat avviato.")
     while running:
-        time.sleep(0.5)
+        time.sleep(1)
         if scanning:
             continue
-        # Non disturbare il bus subito dopo un comando utente
-        if time.time() - last_command_time < HEARTBEAT_BLOCK_AFTER_CMD:
+        if time.time() - last_command_time < 2:
             continue
         if not tx_queue.empty():
-            continue
-        if not priority_tx_queue.empty():
             continue
         if tx_queue.qsize() > TX_QUEUE_HIGH:
             log.warning("TX queue troppo piena, salto heartbeat")
@@ -703,15 +652,12 @@ def heartbeat_thread():
         except queue.Full:
             pass
         ping_counter = (ping_counter + 1) % 100
-        time.sleep(INTRA_QUERY_DELAY)
+        time.sleep(0.2)
 
         with state_lock:
             boards_snapshot = list(detected_boards.items())
 
         for board_id, info in boards_snapshot:
-            # Se nel frattempo è arrivato un comando utente, abbandona il ciclo
-            if time.time() - last_command_time < HEARTBEAT_BLOCK_AFTER_CMD:
-                break
             try:
                 if info["type"] in ("switch", "light"):
                     tx_queue.put(build_frame("Q", info["machine"], info["address"], "ST"), timeout=0.5)
@@ -726,11 +672,11 @@ def heartbeat_thread():
             except queue.Full:
                 log.warning("TX queue piena durante heartbeat")
                 break
-            time.sleep(INTRA_QUERY_DELAY)
+            time.sleep(0.1)
 
-        # Idle finale, interrompibile se arriva un comando utente
-        idle_until = time.time() + HEARTBEAT_PERIOD
-        while running and time.time() < idle_until:
+        for _ in range(50):
+            if not running:
+                break
             time.sleep(0.1)
 
 # ─────────────────────────────────────────
@@ -788,8 +734,7 @@ def on_message(client, userdata, msg):
         # Comando generico TN234
         if len(parts) > 2 and parts[2] == "cmd":
             last_command_time = time.time()
-            drain_heartbeat_queue()
-            priority_tx_queue.put(build_frame("S", mm, aa, payload))
+            tx_queue.put(build_frame("S", mm, aa, payload), timeout=1.0)
             return
 
         # Comando relè TN267
@@ -804,8 +749,7 @@ def on_message(client, userdata, msg):
                     channel_states[key] = vuole_on
                 publish_relay_state(board_id, relay_num, vuole_on)
                 last_command_time = time.time()
-                drain_heartbeat_queue()
-                priority_tx_queue.put(build_frame("S", mm, aa, f"P{relay_num}"))
+                tx_queue.put(build_frame("S", mm, aa, f"P{relay_num}"), timeout=1.0)
             else:
                 log.info(f"  {board_id}/rele{relay_num} già {payload}")
             return
@@ -842,8 +786,7 @@ def on_message(client, userdata, msg):
                     if ev:
                         ev.set()
             else:
-                drain_heartbeat_queue()
-                priority_tx_queue.put(build_frame("S", mm, aa, f"P{ch}"))
+                tx_queue.put(build_frame("S", mm, aa, f"P{ch}"), timeout=1.0)
         else:
             log.info(f"  {board_id}/canale{ch} già {payload}")
 
