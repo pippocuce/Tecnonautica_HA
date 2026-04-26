@@ -69,6 +69,11 @@ COMMAND_ECHO_WINDOW = 0.25
 TX_QUEUE_HIGH = 50
 # Pausa fra frame TX (s) — minima per non saturare RS485 a 19200 baud
 TX_INTERFRAME_DELAY = 0.015
+# Pausa extra dopo l'invio di una query (Q…) per lasciare alla scheda il tempo
+# di rispondere e liberare il bus prima del prossimo TX. Evita collisioni.
+TX_POST_QUERY_DELAY = 0.08
+# Polling della coda normale: tenuto basso così i frame prioritari partono subito
+TX_QUEUE_POLL = 0.02
 
 # ─────────────────────────────────────────
 # PORTA SERIALE (con riapertura automatica)
@@ -478,10 +483,23 @@ def tx_thread():
             from_priority = True
         except queue.Empty:
             # 2) Altrimenti la coda normale (heartbeat / query)
+            #    Polling breve così un eventuale comando prioritario in arrivo
+            #    parte entro TX_QUEUE_POLL (~20 ms) invece di 100 ms.
             try:
-                frame = tx_queue.get(timeout=0.1)
+                frame = tx_queue.get(timeout=TX_QUEUE_POLL)
             except queue.Empty:
                 continue
+            # Doppio check: se nel frattempo è arrivato un priority,
+            # rimanda il frame heartbeat in coda e processa il priority.
+            try:
+                pframe = priority_tx_queue.get_nowait()
+                tx_queue.put_nowait(frame)
+                frame = pframe
+                from_priority = True
+            except queue.Empty:
+                pass
+            except queue.Full:
+                pass
 
         try:
             if not scanning:
@@ -491,7 +509,10 @@ def tx_thread():
                 priority_tx_queue.task_done()
             else:
                 tx_queue.task_done()
-            time.sleep(TX_INTERFRAME_DELAY)
+            # Se era una query (frame del tipo "[Q…"), aspetta più a lungo
+            # per dare tempo alla scheda di rispondere e liberare il bus.
+            is_query = len(frame) > 1 and frame[1] == "Q"
+            time.sleep(TX_POST_QUERY_DELAY if is_query else TX_INTERFRAME_DELAY)
         except Exception as e:
             log.error(f"TX errore: {e}")
 
@@ -649,17 +670,26 @@ def parse_frame(msg):
 # THREAD HEARTBEAT
 # ─────────────────────────────────────────
 def heartbeat_thread():
+    """Polling periodico delle schede.
+       - Si ferma per HEARTBEAT_BLOCK_AFTER_CMD secondi dopo un comando utente.
+       - Cicla ogni HEARTBEAT_PERIOD secondi quando il bus è libero."""
+    HEARTBEAT_PERIOD          = 5.0   # ciclo completo (s)
+    HEARTBEAT_BLOCK_AFTER_CMD = 3.0   # silenzio dopo un comando utente (s)
+    INTRA_QUERY_DELAY         = 0.05  # pausa tra query consecutive
     ping_counter = 0
     mqtt_ready.wait()
     time.sleep(2)
     log.info("Heartbeat avviato.")
     while running:
-        time.sleep(1)
+        time.sleep(0.5)
         if scanning:
             continue
-        if time.time() - last_command_time < 2:
+        # Non disturbare il bus subito dopo un comando utente
+        if time.time() - last_command_time < HEARTBEAT_BLOCK_AFTER_CMD:
             continue
         if not tx_queue.empty():
+            continue
+        if not priority_tx_queue.empty():
             continue
         if tx_queue.qsize() > TX_QUEUE_HIGH:
             log.warning("TX queue troppo piena, salto heartbeat")
@@ -673,12 +703,15 @@ def heartbeat_thread():
         except queue.Full:
             pass
         ping_counter = (ping_counter + 1) % 100
-        time.sleep(0.2)
+        time.sleep(INTRA_QUERY_DELAY)
 
         with state_lock:
             boards_snapshot = list(detected_boards.items())
 
         for board_id, info in boards_snapshot:
+            # Se nel frattempo è arrivato un comando utente, abbandona il ciclo
+            if time.time() - last_command_time < HEARTBEAT_BLOCK_AFTER_CMD:
+                break
             try:
                 if info["type"] in ("switch", "light"):
                     tx_queue.put(build_frame("Q", info["machine"], info["address"], "ST"), timeout=0.5)
@@ -693,11 +726,11 @@ def heartbeat_thread():
             except queue.Full:
                 log.warning("TX queue piena durante heartbeat")
                 break
-            time.sleep(0.1)
+            time.sleep(INTRA_QUERY_DELAY)
 
-        for _ in range(50):
-            if not running:
-                break
+        # Idle finale, interrompibile se arriva un comando utente
+        idle_until = time.time() + HEARTBEAT_PERIOD
+        while running and time.time() < idle_until:
             time.sleep(0.1)
 
 # ─────────────────────────────────────────
