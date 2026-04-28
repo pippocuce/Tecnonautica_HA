@@ -22,12 +22,12 @@ BOARDS_FILE = "/data/boards.json"
 SCAN_TOPIC  = "tecnonautica/scan"
 
 MACHINE_TYPES = {
-    "T2": {"name": "TN218",  "channels": 6,  "type": "switch"},
-    "T1": {"name": "TN222",  "channels": 10, "type": "switch"},
-    "PM": {"name": "TN267",  "channels": 6,  "type": "hybrid"},
-    "AL": {"name": "TN234",  "channels": 16, "type": "alarm"},
-    "SP": {"name": "TN223",  "channels": 10, "type": "switch"},
-    "SL": {"name": "TN224",  "channels": 6,  "type": "light"},
+    "T2": {"name": "TN218",  "channels": 6,  "type": "switch",  "feedback": 6},
+    "T1": {"name": "TN222",  "channels": 10, "type": "switch",  "feedback": 10},
+    "PM": {"name": "TN267",  "channels": 6,  "type": "hybrid",  "feedback": 6},
+    "AL": {"name": "TN234",  "channels": 16, "type": "alarm",   "feedback": 4, "switches": 4},
+    "SP": {"name": "TN223",  "channels": 10, "type": "status",  "feedback": 0},
+    "SL": {"name": "TN224",  "channels": 6,  "type": "light",   "feedback": 6},
 }
 
 detected_boards    = {}
@@ -81,6 +81,9 @@ def send_direct(frame, timeout=0.8):
 def board_display_name(board_id, board_info):
     return BOARD_NAMES.get(board_id, board_info["name"])
 
+# ─────────────────────────────────────────
+# PUBBLICAZIONE STATI
+# ─────────────────────────────────────────
 def publish_state(board_id, ch_num, stato):
     topic = f"tecnonautica/{board_id}/canale{ch_num}/state"
     payload = "ON" if stato else "OFF"
@@ -102,7 +105,6 @@ def publish_alarm_state(board_id, ch_num, stato):
 def publish_sensor_value(board_id, ch_num, value):
     topic = f"tecnonautica/{board_id}/sensore{ch_num}/state"
     
-    # Filtro anti-zero
     if not value:
         print(f"  Ignoro valore vuoto per {board_id}/sensore{ch_num}", flush=True)
         return
@@ -113,15 +115,32 @@ def publish_sensor_value(board_id, ch_num, value):
         print(f"  Ignoro zero per {board_id}/sensore{ch_num} (raw: {value})", flush=True)
         return
     
-    # RIMOSSO: filtro duplicati che causava expire_after
-    # Pubblica sempre per mantenere il sensore vivo
-    
     mqtt_client.publish(topic, str(value), retain=True)
     last_sensor_values[f"{board_id}_{ch_num}"] = value
     print(f"HA <- {board_id}/sensore{ch_num} = {value}", flush=True)
 
+def publish_feedback_state(board_id, fb_num, stato):
+    topic = f"tecnonautica/{board_id}/fb{fb_num}/state"
+    payload = "ON" if stato else "OFF"
+    mqtt_client.publish(topic, payload, retain=True)
+    print(f"HA <- {board_id}/fb{fb_num} = {payload}", flush=True)
+
+def publish_spia_state(board_id, ch_num, stato):
+    topic = f"tecnonautica/{board_id}/spia{ch_num}/state"
+    payload = "ON" if stato else "OFF"
+    mqtt_client.publish(topic, payload, retain=True)
+    print(f"HA <- {board_id}/spia{ch_num} = {payload}", flush=True)
+
+def publish_switch_alarm_state(board_id, sw_num, stato):
+    topic = f"tecnonautica/{board_id}/switch{sw_num}/state"
+    payload = "ON" if stato else "OFF"
+    mqtt_client.publish(topic, payload, retain=True)
+    print(f"HA <- {board_id}/switch{sw_num} = {payload}", flush=True)
+
+# ─────────────────────────────────────────
+# BURST
+# ─────────────────────────────────────────
 def burst_loop(board_id, ch, mm, aa, stop_event):
-    """Modalità burst conforme al protocollo Tecnonautica"""
     stay_frame = build_frame("S", mm, aa, f"S{ch}")
     while not stop_event.is_set():
         tx_queue.put(stay_frame)
@@ -168,6 +187,8 @@ def scan_bus():
                     "type":     info["type"],
                     "name":     f"{info['name']} addr={aa}",
                     "model":    info["name"],
+                    "feedback": info.get("feedback", 0),
+                    "switches": info.get("switches", 0),
                 }
                 print(f"  ✓ Trovata {info['name']} indirizzo {aa}", flush=True)
             time.sleep(0.05)
@@ -240,7 +261,6 @@ def publish_discovery_sensor(board_id, board_info, ch):
     payload = json.dumps({
         "name": name, "unique_id": uid,
         "state_topic": f"tecnonautica/{board_id}/sensore{ch}/state",
-        # RIMOSSO: expire_after che causava unavailable
         "device": {
             "identifiers": [f"tecnonautica_{board_id}"],
             "name": board_display_name(board_id, board_info),
@@ -267,6 +287,58 @@ def publish_discovery_alarm(board_id, board_info, ch):
     })
     mqtt_client.publish(f"homeassistant/binary_sensor/{uid}/config", payload, retain=True)
 
+def publish_discovery_feedback(board_id, board_info, fb_num):
+    uid  = f"tecnonautica_{board_id}_fb{fb_num}"
+    name = f"{board_display_name(board_id, board_info)} Stato {fb_num}"
+    payload = json.dumps({
+        "name": name, "unique_id": uid,
+        "state_topic": f"tecnonautica/{board_id}/fb{fb_num}/state",
+        "payload_on": "ON", "payload_off": "OFF",
+        "device_class": "power",
+        "device": {
+            "identifiers": [f"tecnonautica_{board_id}"],
+            "name": board_display_name(board_id, board_info),
+            "model": board_info["model"],
+            "manufacturer": "Tecnonautica"
+        }
+    })
+    mqtt_client.publish(f"homeassistant/binary_sensor/{uid}/config", payload, retain=True)
+
+def publish_discovery_status(board_id, board_info, ch):
+    uid  = f"tecnonautica_{board_id}_spia{ch}"
+    name = f"{board_display_name(board_id, board_info)} Spia {ch}"
+    payload = json.dumps({
+        "name": name, "unique_id": uid,
+        "state_topic": f"tecnonautica/{board_id}/spia{ch}/state",
+        "payload_on": "ON", "payload_off": "OFF",
+        "device_class": "power",
+        "device": {
+            "identifiers": [f"tecnonautica_{board_id}"],
+            "name": board_display_name(board_id, board_info),
+            "model": board_info["model"],
+            "manufacturer": "Tecnonautica"
+        }
+    })
+    mqtt_client.publish(f"homeassistant/binary_sensor/{uid}/config", payload, retain=True)
+
+def publish_discovery_switch_alarm(board_id, board_info, sw_num):
+    uid  = f"tecnonautica_{board_id}_switch{sw_num}"
+    name = f"{board_display_name(board_id, board_info)} Luce {sw_num}"
+    payload = json.dumps({
+        "name": name, "unique_id": uid,
+        "state_topic":   f"tecnonautica/{board_id}/switch{sw_num}/state",
+        "command_topic": f"tecnonautica/{board_id}/switch{sw_num}/set",
+        "payload_on": "ON", "payload_off": "OFF",
+        "retain": True, "optimistic": False,
+        "device": {
+            "identifiers": [f"tecnonautica_{board_id}"],
+            "name": board_display_name(board_id, board_info),
+            "model": board_info["model"],
+            "manufacturer": "Tecnonautica"
+        }
+    })
+    mqtt_client.publish(f"homeassistant/switch/{uid}/config", payload, retain=True)
+
 def publish_discovery_alarm_controls(board_id, board_info):
     base_name = board_display_name(board_id, board_info)
     for uid_suffix, name_suffix, cmd in [
@@ -287,26 +359,6 @@ def publish_discovery_alarm_controls(board_id, board_info):
         })
         mqtt_client.publish(f"homeassistant/button/{uid}/config", payload, retain=True)
 
-    for uid_suffix, name_suffix, cmd, state_suffix in [
-        ("anchor",    "Luce Ancoraggio",   "FD", "anchor"),
-        ("navlights", "Luci Navigazione",  "NA", "navlights"),
-    ]:
-        uid = f"tecnonautica_{board_id}_{uid_suffix}"
-        payload = json.dumps({
-            "name": f"{base_name} {name_suffix}",
-            "unique_id": uid,
-            "state_topic":   f"tecnonautica/{board_id}/{state_suffix}/state",
-            "command_topic": f"tecnonautica/{board_id}/cmd",
-            "payload_on": cmd, "payload_off": cmd,
-            "retain": True,
-            "device": {
-                "identifiers": [f"tecnonautica_{board_id}"],
-                "name": base_name, "model": board_info["model"],
-                "manufacturer": "Tecnonautica"
-            }
-        })
-        mqtt_client.publish(f"homeassistant/switch/{uid}/config", payload, retain=True)
-
 def publish_scan_button():
     payload = json.dumps({
         "name": "Scansiona Bus",
@@ -323,10 +375,14 @@ def publish_scan_button():
     mqtt_client.publish("homeassistant/button/tecnonautica_scan/config", payload, retain=True)
     print("Pulsante scansione pubblicato", flush=True)
 
+# ─────────────────────────────────────────
+# SETUP BOARD
+# ─────────────────────────────────────────
 def setup_boards(boards):
     global channel_states
     for board_id, info in boards.items():
         print(f"Setup {board_id} ({info['type']})...", flush=True)
+        
         if info["type"] == "hybrid":
             info.setdefault("channel_modes", ["T"] * 6)
             for ch in range(1, 3):
@@ -335,22 +391,49 @@ def setup_boards(boards):
                 channel_states[f"{board_id}_relay_{relay_num}"] = False
                 publish_discovery_relay(board_id, info, relay_num)
                 mqtt_client.subscribe(f"tecnonautica/{board_id}/rele{relay_num}/set")
-        else:
+            for fb_num in range(1, info.get("feedback", 6) + 1):
+                channel_states[f"{board_id}_fb_{fb_num}"] = False
+                publish_discovery_feedback(board_id, info, fb_num)
+                
+        elif info["type"] == "switch":
             for ch in range(1, info["channels"] + 1):
                 channel_states[f"{board_id}_{ch}"] = False
-                if info["type"] == "switch":
-                    publish_discovery_switch(board_id, info, ch)
-                    mqtt_client.subscribe(f"tecnonautica/{board_id}/canale{ch}/set")
-                elif info["type"] == "light":
-                    publish_discovery_light(board_id, info, ch)
-                    mqtt_client.subscribe(f"tecnonautica/{board_id}/canale{ch}/set")
-                elif info["type"] == "sensor":
-                    publish_discovery_sensor(board_id, info, ch)
-                elif info["type"] == "alarm":
-                    publish_discovery_alarm(board_id, info, ch)
-            if info["type"] == "alarm":
-                publish_discovery_alarm_controls(board_id, info)
-                mqtt_client.subscribe(f"tecnonautica/{board_id}/cmd")
+                publish_discovery_switch(board_id, info, ch)
+                mqtt_client.subscribe(f"tecnonautica/{board_id}/canale{ch}/set")
+            fb_count = info.get("feedback", info["channels"])
+            for fb_num in range(1, fb_count + 1):
+                channel_states[f"{board_id}_fb_{fb_num}"] = False
+                publish_discovery_feedback(board_id, info, fb_num)
+                
+        elif info["type"] == "light":
+            for ch in range(1, info["channels"] + 1):
+                channel_states[f"{board_id}_{ch}"] = False
+                publish_discovery_light(board_id, info, ch)
+                mqtt_client.subscribe(f"tecnonautica/{board_id}/canale{ch}/set")
+            fb_count = info.get("feedback", info["channels"])
+            for fb_num in range(1, fb_count + 1):
+                channel_states[f"{board_id}_fb_{fb_num}"] = False
+                publish_discovery_feedback(board_id, info, fb_num)
+                
+        elif info["type"] == "status":
+            for ch in range(1, info["channels"] + 1):
+                channel_states[f"{board_id}_spia_{ch}"] = False
+                publish_discovery_status(board_id, info, ch)
+                
+        elif info["type"] == "alarm":
+            for ch in range(1, info["channels"] + 1):
+                publish_discovery_alarm(board_id, info, ch)
+            switch_count = info.get("switches", 4)
+            for sw_num in range(1, switch_count + 1):
+                channel_states[f"{board_id}_switch_{sw_num}"] = False
+                publish_discovery_switch_alarm(board_id, info, sw_num)
+                mqtt_client.subscribe(f"tecnonautica/{board_id}/switch{sw_num}/set")
+            fb_count = info.get("feedback", 4)
+            for fb_num in range(1, fb_count + 1):
+                channel_states[f"{board_id}_fb_{fb_num}"] = False
+                publish_discovery_feedback(board_id, info, fb_num)
+            publish_discovery_alarm_controls(board_id, info)
+            mqtt_client.subscribe(f"tecnonautica/{board_id}/cmd")
 
 def do_scan():
     global detected_boards, enable_commands_at
@@ -370,7 +453,7 @@ def do_scan():
     mqtt_client.publish(SCAN_TOPIC + "/result", f"Trovate {len(found)} schede", retain=False)
 
 # ─────────────────────────────────────────
-# Thread TX
+# THREAD TX
 # ─────────────────────────────────────────
 def tx_thread():
     TX_INTERFRAME_DELAY = 0.05
@@ -390,7 +473,7 @@ def tx_thread():
             print(f"TX errore: {e}", flush=True)
 
 # ─────────────────────────────────────────
-# Thread RX
+# THREAD RX
 # ─────────────────────────────────────────
 def rx_thread():
     buffer = ""
@@ -417,14 +500,17 @@ def rx_thread():
                 print(f"RX errore: {e}", flush=True)
             time.sleep(0.01)
 
+# ─────────────────────────────────────────
+# PARSING FRAME
+# ─────────────────────────────────────────
 def parse_frame(msg):
     if time.time() - last_command_time < 1.0:
         return
 
-    # Risposta ST — switch/light/hybrid relè
+    # Risposta ST — switch/light/hybrid relè + TN223 spie + TN234 switch
     if "ST" in msg:
         for board_id, info in detected_boards.items():
-            if info["type"] not in ["switch", "light", "hybrid"]:
+            if info["type"] not in ["switch", "light", "hybrid", "status", "alarm"]:
                 continue
             mm = info["machine"]
             aa = info["address"]
@@ -437,22 +523,73 @@ def parse_frame(msg):
                             stati += c
                         elif c in "K*]":
                             break
-                    if info["type"] == "hybrid" and len(stati) == 6:
-                        for i, s in enumerate(stati):
+                    
+                    if info["type"] == "hybrid" and len(stati) >= 6:
+                        for i in range(6):
                             key = f"{board_id}_relay_{i+1}"
-                            nuovo_stato = (s == "1")
+                            nuovo_stato = (stati[i] == "1")
                             if nuovo_stato != channel_states.get(key, False):
                                 channel_states[key] = nuovo_stato
                                 publish_relay_state(board_id, i+1, nuovo_stato)
-                    elif len(stati) == info["channels"]:
-                        for i, s in enumerate(stati):
+                                
+                    elif info["type"] == "status" and len(stati) >= info["channels"]:
+                        for i in range(info["channels"]):
+                            key = f"{board_id}_spia_{i+1}"
+                            nuovo_stato = (stati[i] == "1")
+                            if nuovo_stato != channel_states.get(key, False):
+                                channel_states[key] = nuovo_stato
+                                publish_spia_state(board_id, i+1, nuovo_stato)
+                                
+                    elif info["type"] == "alarm":
+                        switch_count = info.get("switches", 4)
+                        if len(stati) >= switch_count:
+                            for i in range(switch_count):
+                                key = f"{board_id}_switch_{i+1}"
+                                nuovo_stato = (stati[i] == "1")
+                                if nuovo_stato != channel_states.get(key, False):
+                                    channel_states[key] = nuovo_stato
+                                    publish_switch_alarm_state(board_id, i+1, nuovo_stato)
+                                    
+                    elif len(stati) >= info["channels"]:
+                        for i in range(info["channels"]):
                             key = f"{board_id}_{i+1}"
-                            nuovo_stato = (s == "1")
+                            nuovo_stato = (stati[i] == "1")
                             if nuovo_stato != channel_states.get(key, False):
                                 channel_states[key] = nuovo_stato
                                 publish_state(board_id, i+1, nuovo_stato)
+                                
                 except Exception as e:
                     print(f"  Parse ST errore: {e}", flush=True)
+                break
+
+    # Risposta FB — feedback/LED di stato per tutte le schede
+    if "FB" in msg:
+        for board_id, info in detected_boards.items():
+            if info["type"] not in ["switch", "light", "hybrid", "alarm"]:
+                continue
+            mm = info["machine"]
+            aa = info["address"]
+            if mm in msg and f"{mm}{aa}" in msg:
+                try:
+                    idx = msg.find("FB") + 2
+                    stati = ""
+                    for c in msg[idx:]:
+                        if c in "01":
+                            stati += c
+                        elif c in "K*]":
+                            break
+                    
+                    fb_count = info.get("feedback", 0)
+                    if fb_count > 0 and len(stati) >= fb_count:
+                        for i in range(fb_count):
+                            key = f"{board_id}_fb_{i+1}"
+                            nuovo_stato = (stati[i] == "1")
+                            if nuovo_stato != channel_states.get(key, False):
+                                channel_states[key] = nuovo_stato
+                                publish_feedback_state(board_id, i+1, nuovo_stato)
+                                
+                except Exception as e:
+                    print(f"  Parse FB errore: {e}", flush=True)
                 break
 
     # Risposta AS — allarmi TN234
@@ -465,13 +602,13 @@ def parse_frame(msg):
                     idx = msg.find("AS") + 2
                     stati = msg[idx:idx+info["channels"]]
                     for i, s in enumerate(stati):
-                        if s in ["D", "A", "C", "R"]:
+                        if s in ["D", "A", "C", "R", "N"]:
                             publish_alarm_state(board_id, i+1, s)
                 except Exception as e:
                     print(f"  Parse AS errore: {e}", flush=True)
                 break
 
-    # Risposta LS — TN234 luci
+    # Risposta LS — luci TN234
     if "LS" in msg:
         for board_id, info in detected_boards.items():
             if info["type"] != "alarm":
@@ -489,7 +626,7 @@ def parse_frame(msg):
                     print(f"  Parse LS errore: {e}", flush=True)
                 break
 
-    # Risposta CO — configurazione canali TN267 (B=burst, T=toggle)
+    # Risposta CO — configurazione canali TN267
     if "CO" in msg:
         for board_id, info in detected_boards.items():
             if info["type"] != "hybrid":
@@ -512,7 +649,7 @@ def parse_frame(msg):
                     print(f"  Parse CO errore: {e}", flush=True)
                 break
 
-    # Risposta ME — sensori analogici TN267/TN208
+    # Risposta ME — sensori analogici TN267
     if "ME" in msg:
         for board_id, info in detected_boards.items():
             if info["type"] != "hybrid":
@@ -544,7 +681,7 @@ def parse_frame(msg):
                 break
 
 # ─────────────────────────────────────────
-# Thread Heartbeat
+# THREAD HEARTBEAT
 # ─────────────────────────────────────────
 def heartbeat_thread():
     ping_counter = 0
@@ -568,15 +705,19 @@ def heartbeat_thread():
         for board_id, info in detected_boards.items():
             if info["type"] in ["switch", "light"]:
                 tx_queue.put(build_frame("Q", info["machine"], info["address"], "ST"))
+                tx_queue.put(build_frame("Q", info["machine"], info["address"], "FB"))
             elif info["type"] == "hybrid":
                 tx_queue.put(build_frame("Q", info["machine"], info["address"], "ME"))
                 tx_queue.put(build_frame("Q", info["machine"], info["address"], "ST"))
+                tx_queue.put(build_frame("Q", info["machine"], info["address"], "FB"))
                 tx_queue.put(build_frame("Q", info["machine"], info["address"], "CO"))
-            elif info["type"] == "sensor":
-                tx_queue.put(build_frame("Q", info["machine"], info["address"], "ME"))
+            elif info["type"] == "status":
+                tx_queue.put(build_frame("Q", info["machine"], info["address"], "ST"))
             elif info["type"] == "alarm":
                 tx_queue.put(build_frame("Q", info["machine"], info["address"], "AS"))
                 tx_queue.put(build_frame("Q", info["machine"], info["address"], "LS"))
+                tx_queue.put(build_frame("Q", info["machine"], info["address"], "ST"))
+                tx_queue.put(build_frame("Q", info["machine"], info["address"], "FB"))
             time.sleep(0.1)
         for _ in range(50):
             if not running:
@@ -626,7 +767,7 @@ def on_message(client, userdata, msg):
             tx_queue.put(build_frame("S", mm, aa, payload))
             return
 
-        # Comando relè TN267/TN208
+        # Comando relè TN267
         if info["type"] == "hybrid" and len(parts) > 2 and "rele" in parts[2]:
             relay_num = int(parts[2].replace("rele", ""))
             key = f"{board_id}_relay_{relay_num}"
@@ -659,6 +800,22 @@ def on_message(client, userdata, msg):
                     tx_queue.put(build_frame("S", mm, aa, f"P{relay_num}"))
             else:
                 print(f"  {board_id}/rele{relay_num} già {payload}", flush=True)
+            return
+
+        # Comando switch luci TN234
+        if info["type"] == "alarm" and len(parts) > 2 and "switch" in parts[2]:
+            sw_num = int(parts[2].replace("switch", ""))
+            key = f"{board_id}_switch_{sw_num}"
+            stato_attuale = channel_states.get(key, False)
+            vuole_on = (payload == "ON")
+            
+            if vuole_on != stato_attuale:
+                channel_states[key] = vuole_on
+                publish_switch_alarm_state(board_id, sw_num, vuole_on)
+                last_command_time = time.time()
+                tx_queue.put(build_frame("S", mm, aa, f"P{sw_num}"))
+            else:
+                print(f"  {board_id}/switch{sw_num} già {payload}", flush=True)
             return
 
         # Comando canale switch/light con supporto burst
