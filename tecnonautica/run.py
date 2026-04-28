@@ -40,7 +40,7 @@ tx_queue           = queue.Queue()
 mqtt_ready         = threading.Event()
 burst_active       = {}
 
-# NUOVO: memorizza ultimi valori validi dei sensori
+# Memorizza ultimi valori validi dei sensori
 last_sensor_values = {}
 
 print(f"Apertura porta {PORT}...", flush=True)
@@ -102,20 +102,17 @@ def publish_alarm_state(board_id, ch_num, stato):
 def publish_sensor_value(board_id, ch_num, value):
     topic = f"tecnonautica/{board_id}/sensore{ch_num}/state"
     
-    # NUOVO: Filtro anti-zero
+    # Filtro anti-zero
     if not value:
         print(f"  Ignoro valore vuoto per {board_id}/sensore{ch_num}", flush=True)
         return
     
-    # Rimuovi segno e zeri iniziali per il controllo
     test_val = value.replace('+', '').replace('-', '').replace('.', '').strip()
     
-    # Se dopo aver rimosso segno e punti rimane vuoto o tutti zeri, ignora
     if not test_val or test_val == '0' * len(test_val):
         print(f"  Ignoro zero per {board_id}/sensore{ch_num} (raw: {value})", flush=True)
         return
     
-    # Se il valore è identico all'ultimo valido, non ripubblicare (opzionale, riduce traffico)
     key = f"{board_id}_{ch_num}"
     if key in last_sensor_values and last_sensor_values[key] == value:
         return
@@ -125,9 +122,7 @@ def publish_sensor_value(board_id, ch_num, value):
     print(f"HA <- {board_id}/sensore{ch_num} = {value}", flush=True)
 
 def burst_loop(board_id, ch, mm, aa, stop_event):
-    """Modalità burst conforme al protocollo Tecnonautica (par. 4.2/4.4):
-       - manda S{ch} (key STAY pressed) ogni 500 ms finché il tasto è premuto
-       - manda R{ch} (key release) al rilascio"""
+    """Modalità burst conforme al protocollo Tecnonautica"""
     stay_frame = build_frame("S", mm, aa, f"S{ch}")
     while not stop_event.is_set():
         tx_queue.put(stay_frame)
@@ -246,7 +241,7 @@ def publish_discovery_sensor(board_id, board_info, ch):
     payload = json.dumps({
         "name": name, "unique_id": uid,
         "state_topic": f"tecnonautica/{board_id}/sensore{ch}/state",
-        "expire_after": 15,  # NUOVO: considera unavailable dopo 15s senza dati validi
+        "expire_after": 15,
         "device": {
             "identifiers": [f"tecnonautica_{board_id}"],
             "name": board_display_name(board_id, board_info),
@@ -334,7 +329,6 @@ def setup_boards(boards):
     for board_id, info in boards.items():
         print(f"Setup {board_id} ({info['type']})...", flush=True)
         if info["type"] == "hybrid":
-            # Modalità di default: tutti TOGGLE finché la prima Q CO non risponde
             info.setdefault("channel_modes", ["T"] * 6)
             for ch in range(1, 3):
                 publish_discovery_sensor(board_id, info, ch)
@@ -380,13 +374,7 @@ def do_scan():
 # Thread TX
 # ─────────────────────────────────────────
 def tx_thread():
-    # Pausa standard fra un frame e l'altro (come prima)
     TX_INTERFRAME_DELAY = 0.05
-    # Pausa più lunga dopo l'invio di una QUERY (Q ME, Q ST, Q AS, Q LS, Q ID)
-    # per dare tempo alla scheda di rispondere e liberare il bus prima del
-    # frame successivo. Senza questa pausa il `Q ST` parte mentre la scheda
-    # sta ancora rispondendo al `Q ME` -> collisione -> valori sensori corrotti.
-    # 200 ms = sopra il minimo di 180 ms imposto dal protocollo (par. 2.1)
     TX_POST_QUERY_DELAY = 0.20
     while running:
         try:
@@ -395,7 +383,6 @@ def tx_thread():
                 ser.write(frame.encode('ascii'))
                 print(f"TX: {frame}", flush=True)
             tx_queue.task_done()
-            # È una query? il secondo carattere del frame è 'Q' (es. "[QPM00MEKK*xx]")
             is_query = len(frame) > 1 and frame[1] == "Q"
             time.sleep(TX_POST_QUERY_DELAY if is_query else TX_INTERFRAME_DELAY)
         except queue.Empty:
@@ -442,7 +429,8 @@ def parse_frame(msg):
                 continue
             mm = info["machine"]
             aa = info["address"]
-            if mm in msg and aa in msg:
+            # CORRETTO: match esatto PM01, PM02, ecc.
+            if mm in msg and f"{mm}{aa}" in msg:
                 try:
                     idx = msg.find("ST") + 2
                     stati = ""
@@ -474,7 +462,8 @@ def parse_frame(msg):
         for board_id, info in detected_boards.items():
             if info["type"] != "alarm":
                 continue
-            if info["machine"] in msg and info["address"] in msg:
+            # CORRETTO: match esatto AL01, AL02, ecc.
+            if info["machine"] in msg and f"{info['machine']}{info['address']}" in msg:
                 try:
                     idx = msg.find("AS") + 2
                     stati = msg[idx:idx+info["channels"]]
@@ -490,7 +479,8 @@ def parse_frame(msg):
         for board_id, info in detected_boards.items():
             if info["type"] != "alarm":
                 continue
-            if info["machine"] in msg and info["address"] in msg:
+            # CORRETTO: match esatto AL01, AL02, ecc.
+            if info["machine"] in msg and f"{info['machine']}{info['address']}" in msg:
                 try:
                     idx = msg.find("LS") + 2
                     f_state = msg[idx] if idx < len(msg) else "0"
@@ -508,7 +498,8 @@ def parse_frame(msg):
         for board_id, info in detected_boards.items():
             if info["type"] != "hybrid":
                 continue
-            if info["machine"] in msg and info["address"] in msg:
+            # CORRETTO: match esatto PM01, PM02, ecc.
+            if info["machine"] in msg and f"{info['machine']}{info['address']}" in msg:
                 try:
                     idx = msg.find("CO") + 2
                     modes = ""
@@ -531,14 +522,17 @@ def parse_frame(msg):
         for board_id, info in detected_boards.items():
             if info["type"] != "hybrid":
                 continue
-            if info["machine"] in msg and info["address"] in msg:
+            mm = info["machine"]
+            aa = info["address"]
+            # CORRETTO: match esatto PM01, PM02, ecc.
+            if mm in msg and f"{mm}{aa}" in msg:
                 try:
                     for prefix_a in ["A+", "A-"]:
                         if prefix_a in msg:
                             idx = msg.find(prefix_a)
                             raw = msg[idx:idx+7]
                             val = ''.join(c for c in raw if c in '0123456789+-.')
-                            val = val[:6]  # massimo 7 caratteri validi
+                            val = val[:6]
                             if val:
                                 publish_sensor_value(board_id, 1, val)
                             break
@@ -547,7 +541,7 @@ def parse_frame(msg):
                             idx = msg.find(prefix_b)
                             raw = msg[idx:idx+10]
                             val = ''.join(c for c in raw if c in '0123456789+-.')
-                            val = val[:7]  # massimo 7 caratteri validi
+                            val = val[:7]
                             if val:
                                 publish_sensor_value(board_id, 2, val)
                             break
@@ -583,7 +577,6 @@ def heartbeat_thread():
             elif info["type"] == "hybrid":
                 tx_queue.put(build_frame("Q", info["machine"], info["address"], "ME"))
                 tx_queue.put(build_frame("Q", info["machine"], info["address"], "ST"))
-                # Q CO -> rileva i cambi fisici TOGGLE/BURST sui DIP della TN267
                 tx_queue.put(build_frame("Q", info["machine"], info["address"], "CO"))
             elif info["type"] == "sensor":
                 tx_queue.put(build_frame("Q", info["machine"], info["address"], "ME"))
@@ -654,7 +647,6 @@ def on_message(client, userdata, msg):
                 last_command_time = time.time()
 
                 if mode == "B":
-                    # Canale in modalità BURST: serve Sx ripetuto ogni 500 ms + Rx al rilascio
                     burst_key = f"{board_id}_relay_{relay_num}"
                     if vuole_on:
                         stop_event = threading.Event()
@@ -670,7 +662,6 @@ def on_message(client, userdata, msg):
                             burst_active[burst_key].set()
                             del burst_active[burst_key]
                 else:
-                    # Canale in modalità TOGGLE: singolo Px
                     tx_queue.put(build_frame("S", mm, aa, f"P{relay_num}"))
             else:
                 print(f"  {board_id}/rele{relay_num} già {payload}", flush=True)
