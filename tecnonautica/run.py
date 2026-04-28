@@ -1,4 +1,4 @@
-import serial
+cimport serial
 import threading
 import queue
 import time
@@ -39,6 +39,9 @@ enable_commands_at = time.time() + 9999
 tx_queue           = queue.Queue()
 mqtt_ready         = threading.Event()
 burst_active       = {}
+
+# NUOVO: memorizza ultimi valori validi dei sensori
+last_sensor_values = {}
 
 print(f"Apertura porta {PORT}...", flush=True)
 ser = serial.Serial(PORT, BAUD, timeout=0.1)
@@ -98,7 +101,27 @@ def publish_alarm_state(board_id, ch_num, stato):
 
 def publish_sensor_value(board_id, ch_num, value):
     topic = f"tecnonautica/{board_id}/sensore{ch_num}/state"
+    
+    # NUOVO: Filtro anti-zero
+    if not value:
+        print(f"  Ignoro valore vuoto per {board_id}/sensore{ch_num}", flush=True)
+        return
+    
+    # Rimuovi segno e zeri iniziali per il controllo
+    test_val = value.replace('+', '').replace('-', '').replace('.', '').strip()
+    
+    # Se dopo aver rimosso segno e punti rimane vuoto o tutti zeri, ignora
+    if not test_val or test_val == '0' * len(test_val):
+        print(f"  Ignoro zero per {board_id}/sensore{ch_num} (raw: {value})", flush=True)
+        return
+    
+    # Se il valore è identico all'ultimo valido, non ripubblicare (opzionale, riduce traffico)
+    key = f"{board_id}_{ch_num}"
+    if key in last_sensor_values and last_sensor_values[key] == value:
+        return
+    
     mqtt_client.publish(topic, str(value), retain=True)
+    last_sensor_values[key] = value
     print(f"HA <- {board_id}/sensore{ch_num} = {value}", flush=True)
 
 def burst_loop(board_id, ch, mm, aa, stop_event):
@@ -223,6 +246,7 @@ def publish_discovery_sensor(board_id, board_info, ch):
     payload = json.dumps({
         "name": name, "unique_id": uid,
         "state_topic": f"tecnonautica/{board_id}/sensore{ch}/state",
+        "expire_after": 15,  # NUOVO: considera unavailable dopo 15s senza dati validi
         "device": {
             "identifiers": [f"tecnonautica_{board_id}"],
             "name": board_display_name(board_id, board_info),
@@ -530,6 +554,7 @@ def parse_frame(msg):
                 except Exception as e:
                     print(f"  Parse ME errore: {e}", flush=True)
                 break
+
 # ─────────────────────────────────────────
 # Thread Heartbeat
 # ─────────────────────────────────────────
@@ -733,4 +758,3 @@ except KeyboardInterrupt:
     mqtt_client.loop_stop()
     mqtt_client.disconnect()
     ser.close()
-PYEOF
