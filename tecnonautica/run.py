@@ -113,12 +113,11 @@ def publish_sensor_value(board_id, ch_num, value):
         print(f"  Ignoro zero per {board_id}/sensore{ch_num} (raw: {value})", flush=True)
         return
     
-    key = f"{board_id}_{ch_num}"
-    if key in last_sensor_values and last_sensor_values[key] == value:
-        return
+    # RIMOSSO: filtro duplicati che causava expire_after
+    # Pubblica sempre per mantenere il sensore vivo
     
     mqtt_client.publish(topic, str(value), retain=True)
-    last_sensor_values[key] = value
+    last_sensor_values[f"{board_id}_{ch_num}"] = value
     print(f"HA <- {board_id}/sensore{ch_num} = {value}", flush=True)
 
 def burst_loop(board_id, ch, mm, aa, stop_event):
@@ -241,7 +240,7 @@ def publish_discovery_sensor(board_id, board_info, ch):
     payload = json.dumps({
         "name": name, "unique_id": uid,
         "state_topic": f"tecnonautica/{board_id}/sensore{ch}/state",
-        "expire_after": 15,
+        # RIMOSSO: expire_after che causava unavailable
         "device": {
             "identifiers": [f"tecnonautica_{board_id}"],
             "name": board_display_name(board_id, board_info),
@@ -429,7 +428,6 @@ def parse_frame(msg):
                 continue
             mm = info["machine"]
             aa = info["address"]
-            # CORRETTO: match esatto PM01, PM02, ecc.
             if mm in msg and f"{mm}{aa}" in msg:
                 try:
                     idx = msg.find("ST") + 2
@@ -462,7 +460,6 @@ def parse_frame(msg):
         for board_id, info in detected_boards.items():
             if info["type"] != "alarm":
                 continue
-            # CORRETTO: match esatto AL01, AL02, ecc.
             if info["machine"] in msg and f"{info['machine']}{info['address']}" in msg:
                 try:
                     idx = msg.find("AS") + 2
@@ -479,7 +476,6 @@ def parse_frame(msg):
         for board_id, info in detected_boards.items():
             if info["type"] != "alarm":
                 continue
-            # CORRETTO: match esatto AL01, AL02, ecc.
             if info["machine"] in msg and f"{info['machine']}{info['address']}" in msg:
                 try:
                     idx = msg.find("LS") + 2
@@ -498,7 +494,6 @@ def parse_frame(msg):
         for board_id, info in detected_boards.items():
             if info["type"] != "hybrid":
                 continue
-            # CORRETTO: match esatto PM01, PM02, ecc.
             if info["machine"] in msg and f"{info['machine']}{info['address']}" in msg:
                 try:
                     idx = msg.find("CO") + 2
@@ -524,7 +519,6 @@ def parse_frame(msg):
                 continue
             mm = info["machine"]
             aa = info["address"]
-            # CORRETTO: match esatto PM01, PM02, ecc.
             if mm in msg and f"{mm}{aa}" in msg:
                 try:
                     for prefix_a in ["A+", "A-"]:
