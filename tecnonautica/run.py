@@ -477,6 +477,8 @@ def tx_thread():
 # ─────────────────────────────────────────
 def rx_thread():
     buffer = ""
+    RX_TIMEOUT = 0.15  # se il buffer non si chiude entro 150ms, scartiamo
+    last_rx_time = time.time()
     while running:
         if scanning:
             time.sleep(0.1)
@@ -484,19 +486,43 @@ def rx_thread():
         try:
             data = ser.read(64)
             if data:
-                buffer += data.decode('ascii', errors='replace')
-                while '[' in buffer and ']' in buffer:
+                # Decodifica e scarta caratteri di controllo spuri
+                chunk = data.decode('ascii', errors='replace')
+                chunk = ''.join(c for c in chunk if c >= ' ' or c in '\r\n')
+                buffer += chunk
+                last_rx_time = time.time()
+
+                # Estrai tutti i frame completi presenti nel buffer (gestisce frame concatenati)
+                while True:
                     start = buffer.find('[')
-                    end   = buffer.find(']', start)
-                    if end != -1:
-                        frame = buffer[start:end+1]
-                        buffer = buffer[end+1:]
-                        print(f"RX: {frame}", flush=True)
-                        parse_frame(frame)
-                    else:
+                    if start == -1:
+                        buffer = ""
                         break
+                    if start > 0:
+                        buffer = buffer[start:]  # scarta spazzatura prima di '['
+                    end = buffer.find(']')
+                    if end == -1:
+                        break  # frame incompleto, aspettiamo altri dati
+                    frame = buffer[:end+1]
+                    buffer = buffer[end+1:]
+
+                    # Valida: deve avere checksum di 2 hex dopo '*'
+                    star_idx = frame.rfind('*')
+                    if star_idx != -1 and len(frame) >= star_idx + 3:
+                        cs_hex = frame[star_idx+1:star_idx+3]
+                        if all(c in '0123456789ABCDEFabcdef' for c in cs_hex):
+                            print(f"RX: {frame}", flush=True)
+                            parse_frame(frame)
+                        else:
+                            print(f"RX scartato (cs non valido): {frame}", flush=True)
+                    else:
+                        print(f"RX scartato (incompleto): {frame}", flush=True)
             else:
-                time.sleep(0.005)  # 5ms sleep se non ci sono dati, evita busy-loop
+                # Reset buffer se aperto da troppo tempo senza chiudersi
+                if buffer and (time.time() - last_rx_time) > RX_TIMEOUT:
+                    print(f"RX timeout, buffer scartato: {buffer!r}", flush=True)
+                    buffer = ""
+                time.sleep(0.005)
         except Exception as e:
             if running:
                 print(f"RX errore: {e}", flush=True)
@@ -508,6 +534,10 @@ def rx_thread():
 def parse_frame(msg):
     # Nessun blackout dopo il comando: processiamo subito le risposte delle schede
 
+    # Risposta di errore (E = Unknown command) — logga e ignora
+    if len(msg) > 1 and msg[1] == 'E':
+        print(f"  Scheda errore (comando non supportato): {msg}", flush=True)
+        return
     # Risposta ST — switch/light/hybrid relè + TN223 spie + TN234 switch
     if "ST" in msg:
         for board_id, info in detected_boards.items():
@@ -659,24 +689,34 @@ def parse_frame(msg):
             aa = info["address"]
             if mm in msg and f"{mm}{aa}" in msg:
                 try:
+                    # Estrai solo la parte dati tra ME e KK, per non confondere col checksum
+                    me_idx = msg.find("ME") + 2
+                    kk_idx = msg.find("KK", me_idx)
+                    if kk_idx == -1:
+                        print(f"  ME frame troncato, scarto: {msg}", flush=True)
+                        break
+                    data_section = msg[me_idx:kk_idx]  # es: "A+00001B+00054"
+
                     for prefix_a in ["A+", "A-"]:
-                        if prefix_a in msg:
-                            idx = msg.find(prefix_a)
-                            raw = msg[idx:idx+7]
+                        if prefix_a in data_section:
+                            idx = data_section.find(prefix_a)
+                            raw = data_section[idx:idx+7]
                             val = ''.join(c for c in raw if c in '0123456789+-.')
                             val = val[:6]
                             if val:
                                 publish_sensor_value(board_id, 1, val)
                             break
+
                     for prefix_b in ["B+", "B-"]:
-                        if prefix_b in msg:
-                            idx = msg.find(prefix_b)
-                            raw = msg[idx:idx+10]
+                        if prefix_b in data_section:
+                            idx = data_section.find(prefix_b)
+                            raw = data_section[idx:idx+8]
                             val = ''.join(c for c in raw if c in '0123456789+-.')
                             val = val[:7]
                             if val:
                                 publish_sensor_value(board_id, 2, val)
                             break
+
                 except Exception as e:
                     print(f"  Parse ME errore: {e}", flush=True)
                 break
@@ -714,9 +754,8 @@ def heartbeat_thread():
                 tx_queue.put(build_frame("Q", info["machine"], info["address"], "ST"))
             elif info["type"] == "alarm":
                 tx_queue.put(build_frame("Q", info["machine"], info["address"], "AS"))
-                tx_queue.put(build_frame("Q", info["machine"], info["address"], "LS"))
                 tx_queue.put(build_frame("Q", info["machine"], info["address"], "ST"))
-                tx_queue.put(build_frame("Q", info["machine"], info["address"], "FB"))
+                # Nota: LS e FB non supportati da tutte le schede AL (rispondono con errore U)
             time.sleep(0.1)
         for _ in range(20):   # 2 secondi tra un ciclo di polling e il successivo (era 5s)
             if not running:
