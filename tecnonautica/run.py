@@ -701,49 +701,49 @@ def parse_frame(msg):
     # Risposta ME — sensori analogici TN267
     if "ME" in msg:
 
-    for board_id, info in detected_boards.items():
+        for board_id, info in detected_boards.items():
 
-        if info["type"] != "hybrid":
-            continue
+            if info["type"] != "hybrid":
+                continue
 
-        mm = info["machine"]
-        aa = info["address"]
+            mm = info["machine"]
+            aa = info["address"]
 
-        if mm in msg and f"{mm}{aa}" in msg:
+            if mm in msg and f"{mm}{aa}" in msg:
 
-            try:
+                try:
 
-                # Sensore A
-                pos_a = msg.find("A+")
+                    # Sensore A
+                    pos_a = msg.find("A+")
 
-                if pos_a == -1:
-                    pos_a = msg.find("A-")
+                    if pos_a == -1:
+                        pos_a = msg.find("A-")
 
-                if pos_a != -1:
+                    if pos_a != -1:
 
-                    val_a = msg[pos_a:pos_a + 6]
+                        val_a = msg[pos_a:pos_a + 6]
 
-                    if len(val_a) == 6:
-                        publish_sensor_value(board_id, 1, val_a)
+                        if len(val_a) == 6:
+                            publish_sensor_value(board_id, 1, val_a)
 
-                # Sensore B
-                pos_b = msg.find("B+")
+                    # Sensore B
+                    pos_b = msg.find("B+")
 
-                if pos_b == -1:
-                    pos_b = msg.find("B-")
+                    if pos_b == -1:
+                        pos_b = msg.find("B-")
 
-                if pos_b != -1:
+                    if pos_b != -1:
 
-                    val_b = msg[pos_b:pos_b + 6]
+                        val_b = msg[pos_b:pos_b + 6]
 
-                    if len(val_b) == 6:
-                        publish_sensor_value(board_id, 2, val_b)
+                        if len(val_b) == 6:
+                            publish_sensor_value(board_id, 2, val_b)
 
-            except Exception as e:
+                except Exception as e:
 
-                print(f"  Parse ME errore: {e}", flush=True)
+                    print(f"  Parse ME errore: {e}", flush=True)
 
-            break
+                break
 
 # ─────────────────────────────────────────
 # THREAD HEARTBEAT
