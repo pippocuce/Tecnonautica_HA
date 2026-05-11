@@ -36,7 +36,8 @@ scanning           = False
 channel_states     = {}
 last_command_time  = 0
 enable_commands_at = time.time() + 9999
-tx_queue           = queue.Queue()
+tx_queue           = queue.Queue()      # Query di stato / heartbeat
+cmd_queue          = queue.Queue()      # Comandi da MQTT (alta priorità)
 mqtt_ready         = threading.Event()
 burst_active       = {}
 
@@ -143,9 +144,12 @@ def publish_switch_alarm_state(board_id, sw_num, stato):
 def burst_loop(board_id, ch, mm, aa, stop_event):
     stay_frame = build_frame("S", mm, aa, f"S{ch}")
     while not stop_event.is_set():
-        tx_queue.put(stay_frame)
+        cmd_queue.put(stay_frame)
         stop_event.wait(0.5)
-    tx_queue.put(build_frame("S", mm, aa, f"R{ch}"))
+    cmd_queue.put(build_frame("S", mm, aa, f"R{ch}"))
+    # Richiedi stato subito dopo il burst
+    tx_queue.put(build_frame("Q", mm, aa, "ST"))
+    tx_queue.put(build_frame("Q", mm, aa, "FB"))
     print(f"Burst stop {board_id}/canale{ch}", flush=True)
 
 # ─────────────────────────────────────────
@@ -456,29 +460,40 @@ def do_scan():
 # THREAD TX
 # ─────────────────────────────────────────
 def tx_thread():
-    TX_INTERFRAME_DELAY = 0.02   # 20ms tra frame normali (era 50ms)
-    TX_POST_QUERY_DELAY = 0.08   # 80ms dopo query, tempo sufficiente per la risposta (era 200ms)
+    global last_command_time
+    TX_INTERFRAME_DELAY = 0.03
+    TX_POST_QUERY_DELAY = 0.08
     while running:
         try:
-            frame = tx_queue.get(timeout=0.1)
-            if not scanning:
-                ser.write(frame.encode('ascii'))
-                print(f"TX: {frame}", flush=True)
-            tx_queue.task_done()
-            is_query = len(frame) > 1 and frame[1] == "Q"
-            time.sleep(TX_POST_QUERY_DELAY if is_query else TX_INTERFRAME_DELAY)
+            # Alta priorità ai comandi
+            frame = cmd_queue.get(timeout=0.02)
+            from_cmd = True
         except queue.Empty:
-            pass
-        except Exception as e:
-            print(f"TX errore: {e}", flush=True)
+            try:
+                frame = tx_queue.get(timeout=0.1)
+                from_cmd = False
+            except queue.Empty:
+                continue
+        
+        if not scanning:
+            ser.write(frame.encode('ascii'))
+            print(f"TX: {frame}", flush=True)
+            if from_cmd:
+                last_command_time = time.time()
+        
+        if from_cmd:
+            cmd_queue.task_done()
+        else:
+            tx_queue.task_done()
+            
+        is_query = len(frame) > 1 and frame[1] == "Q"
+        time.sleep(TX_POST_QUERY_DELAY if is_query else TX_INTERFRAME_DELAY)
 
 # ─────────────────────────────────────────
 # THREAD RX
 # ─────────────────────────────────────────
 def rx_thread():
     buffer = ""
-    RX_TIMEOUT = 0.15  # se il buffer non si chiude entro 150ms, scartiamo
-    last_rx_time = time.time()
     while running:
         if scanning:
             time.sleep(0.1)
@@ -486,43 +501,17 @@ def rx_thread():
         try:
             data = ser.read(64)
             if data:
-                # Decodifica e scarta caratteri di controllo spuri
-                chunk = data.decode('ascii', errors='replace')
-                chunk = ''.join(c for c in chunk if c >= ' ' or c in '\r\n')
-                buffer += chunk
-                last_rx_time = time.time()
-
-                # Estrai tutti i frame completi presenti nel buffer (gestisce frame concatenati)
-                while True:
+                buffer += data.decode('ascii', errors='replace')
+                while '[' in buffer and ']' in buffer:
                     start = buffer.find('[')
-                    if start == -1:
-                        buffer = ""
-                        break
-                    if start > 0:
-                        buffer = buffer[start:]  # scarta spazzatura prima di '['
-                    end = buffer.find(']')
-                    if end == -1:
-                        break  # frame incompleto, aspettiamo altri dati
-                    frame = buffer[:end+1]
-                    buffer = buffer[end+1:]
-
-                    # Valida: deve avere checksum di 2 hex dopo '*'
-                    star_idx = frame.rfind('*')
-                    if star_idx != -1 and len(frame) >= star_idx + 3:
-                        cs_hex = frame[star_idx+1:star_idx+3]
-                        if all(c in '0123456789ABCDEFabcdef' for c in cs_hex):
-                            print(f"RX: {frame}", flush=True)
-                            parse_frame(frame)
-                        else:
-                            print(f"RX scartato (cs non valido): {frame}", flush=True)
+                    end   = buffer.find(']', start)
+                    if end != -1:
+                        frame = buffer[start:end+1]
+                        buffer = buffer[end+1:]
+                        print(f"RX: {frame}", flush=True)
+                        parse_frame(frame)
                     else:
-                        print(f"RX scartato (incompleto): {frame}", flush=True)
-            else:
-                # Reset buffer se aperto da troppo tempo senza chiudersi
-                if buffer and (time.time() - last_rx_time) > RX_TIMEOUT:
-                    print(f"RX timeout, buffer scartato: {buffer!r}", flush=True)
-                    buffer = ""
-                time.sleep(0.005)
+                        break
         except Exception as e:
             if running:
                 print(f"RX errore: {e}", flush=True)
@@ -532,12 +521,10 @@ def rx_thread():
 # PARSING FRAME
 # ─────────────────────────────────────────
 def parse_frame(msg):
-    # Nessun blackout dopo il comando: processiamo subito le risposte delle schede
-
-    # Risposta di errore (E = Unknown command) — logga e ignora
-    if len(msg) > 1 and msg[1] == 'E':
-        print(f"  Scheda errore (comando non supportato): {msg}", flush=True)
+    # Salta solo l'eco del comando trasmesso (primi 150 ms)
+    if time.time() - last_command_time < 0.15:
         return
+
     # Risposta ST — switch/light/hybrid relè + TN223 spie + TN234 switch
     if "ST" in msg:
         for board_id, info in detected_boards.items():
@@ -689,34 +676,24 @@ def parse_frame(msg):
             aa = info["address"]
             if mm in msg and f"{mm}{aa}" in msg:
                 try:
-                    # Estrai solo la parte dati tra ME e KK, per non confondere col checksum
-                    me_idx = msg.find("ME") + 2
-                    kk_idx = msg.find("KK", me_idx)
-                    if kk_idx == -1:
-                        print(f"  ME frame troncato, scarto: {msg}", flush=True)
-                        break
-                    data_section = msg[me_idx:kk_idx]  # es: "A+00001B+00054"
-
                     for prefix_a in ["A+", "A-"]:
-                        if prefix_a in data_section:
-                            idx = data_section.find(prefix_a)
-                            raw = data_section[idx:idx+7]
+                        if prefix_a in msg:
+                            idx = msg.find(prefix_a)
+                            raw = msg[idx:idx+7]
                             val = ''.join(c for c in raw if c in '0123456789+-.')
                             val = val[:6]
                             if val:
                                 publish_sensor_value(board_id, 1, val)
                             break
-
                     for prefix_b in ["B+", "B-"]:
-                        if prefix_b in data_section:
-                            idx = data_section.find(prefix_b)
-                            raw = data_section[idx:idx+8]
+                        if prefix_b in msg:
+                            idx = msg.find(prefix_b)
+                            raw = msg[idx:idx+10]
                             val = ''.join(c for c in raw if c in '0123456789+-.')
                             val = val[:7]
                             if val:
                                 publish_sensor_value(board_id, 2, val)
                             break
-
                 except Exception as e:
                     print(f"  Parse ME errore: {e}", flush=True)
                 break
@@ -733,7 +710,9 @@ def heartbeat_thread():
         time.sleep(1)
         if scanning:
             continue
-        if not tx_queue.empty():
+        if time.time() - last_command_time < 2:
+            continue
+        if not tx_queue.empty() or not cmd_queue.empty():
             continue
         nn = f"{ping_counter:02d}"
         body = f"P{nn}KK"
@@ -754,10 +733,11 @@ def heartbeat_thread():
                 tx_queue.put(build_frame("Q", info["machine"], info["address"], "ST"))
             elif info["type"] == "alarm":
                 tx_queue.put(build_frame("Q", info["machine"], info["address"], "AS"))
+                tx_queue.put(build_frame("Q", info["machine"], info["address"], "LS"))
                 tx_queue.put(build_frame("Q", info["machine"], info["address"], "ST"))
-                # Nota: LS e FB non supportati da tutte le schede AL (rispondono con errore U)
-            time.sleep(0.1)
-        for _ in range(20):   # 2 secondi tra un ciclo di polling e il successivo (era 5s)
+                tx_queue.put(build_frame("Q", info["machine"], info["address"], "FB"))
+            time.sleep(0.05)
+        for _ in range(20):  # Pausa 2 s invece di 5 s
             if not running:
                 break
             time.sleep(0.1)
@@ -801,8 +781,9 @@ def on_message(client, userdata, msg):
 
         # Comando TN234
         if len(parts) > 2 and parts[2] == "cmd":
-            last_command_time = time.time()
-            tx_queue.put(build_frame("S", mm, aa, payload))
+            cmd_queue.put(build_frame("S", mm, aa, payload))
+            tx_queue.put(build_frame("Q", mm, aa, "AS"))
+            tx_queue.put(build_frame("Q", mm, aa, "LS"))
             return
 
         # Comando relè TN267
@@ -817,7 +798,6 @@ def on_message(client, userdata, msg):
             if vuole_on != stato_attuale:
                 channel_states[key] = vuole_on
                 publish_relay_state(board_id, relay_num, vuole_on)
-                last_command_time = time.time()
 
                 if mode == "B":
                     burst_key = f"{board_id}_relay_{relay_num}"
@@ -835,8 +815,7 @@ def on_message(client, userdata, msg):
                             burst_active[burst_key].set()
                             del burst_active[burst_key]
                 else:
-                    tx_queue.put(build_frame("S", mm, aa, f"P{relay_num}"))
-                    # Conferma rapida dello stato dopo il comando
+                    cmd_queue.put(build_frame("S", mm, aa, f"P{relay_num}"))
                     tx_queue.put(build_frame("Q", mm, aa, "ST"))
                     tx_queue.put(build_frame("Q", mm, aa, "FB"))
             else:
@@ -853,9 +832,7 @@ def on_message(client, userdata, msg):
             if vuole_on != stato_attuale:
                 channel_states[key] = vuole_on
                 publish_switch_alarm_state(board_id, sw_num, vuole_on)
-                last_command_time = time.time()
-                tx_queue.put(build_frame("S", mm, aa, f"P{sw_num}"))
-                # Conferma rapida dello stato dopo il comando
+                cmd_queue.put(build_frame("S", mm, aa, f"P{sw_num}"))
                 tx_queue.put(build_frame("Q", mm, aa, "ST"))
                 tx_queue.put(build_frame("Q", mm, aa, "FB"))
             else:
@@ -873,7 +850,6 @@ def on_message(client, userdata, msg):
         if vuole_on != stato_attuale:
             channel_states[key] = vuole_on
             publish_state(board_id, ch, vuole_on)
-            last_command_time = time.time()
 
             if mode == "B":
                 burst_key = f"{board_id}_{ch}"
@@ -891,8 +867,7 @@ def on_message(client, userdata, msg):
                         burst_active[burst_key].set()
                         del burst_active[burst_key]
             else:
-                tx_queue.put(build_frame("S", mm, aa, f"P{ch}"))
-                # Conferma rapida dello stato dopo il comando
+                cmd_queue.put(build_frame("S", mm, aa, f"P{ch}"))
                 tx_queue.put(build_frame("Q", mm, aa, "ST"))
                 tx_queue.put(build_frame("Q", mm, aa, "FB"))
         else:
