@@ -44,7 +44,7 @@ burst_active       = {}
 last_sensor_values = {}
 
 print(f"Apertura porta {PORT}...", flush=True)
-ser = serial.Serial(PORT, BAUD, timeout=0.02)
+ser = serial.Serial(PORT, BAUD, timeout=0.1)
 print("Porta aperta!", flush=True)
 
 def checksum(data):
@@ -456,33 +456,19 @@ def do_scan():
 # THREAD TX
 # ─────────────────────────────────────────
 def tx_thread():
-
-    TX_INTERFRAME_DELAY = 0.03
-    TX_POST_QUERY_DELAY = 0.08
-
+    TX_INTERFRAME_DELAY = 0.05
+    TX_POST_QUERY_DELAY = 0.20
     while running:
-
         try:
             frame = tx_queue.get(timeout=0.1)
-
             if not scanning:
-
                 ser.write(frame.encode('ascii'))
-
                 print(f"TX: {frame}", flush=True)
-
             tx_queue.task_done()
-
             is_query = len(frame) > 1 and frame[1] == "Q"
-
-            if is_query:
-                time.sleep(TX_POST_QUERY_DELAY)
-            else:
-                time.sleep(TX_INTERFRAME_DELAY)
-
+            time.sleep(TX_POST_QUERY_DELAY if is_query else TX_INTERFRAME_DELAY)
         except queue.Empty:
             pass
-
         except Exception as e:
             print(f"TX errore: {e}", flush=True)
 
@@ -490,76 +476,36 @@ def tx_thread():
 # THREAD RX
 # ─────────────────────────────────────────
 def rx_thread():
-
     buffer = ""
-
     while running:
-
         if scanning:
-            time.sleep(0.02)
+            time.sleep(0.1)
             continue
-
         try:
-
-            data = ser.read(256)
-
-            if not data:
-                continue
-
-            chunk = data.decode('ascii', errors='ignore')
-
-            buffer += chunk
-
-            # evita buffer infinito
-            if len(buffer) > 2048:
-                buffer = buffer[-1024:]
-
-            while True:
-
-                start = buffer.find('[')
-
-                if start == -1:
-                    buffer = ""
-                    break
-
-                end = buffer.find(']', start)
-
-                if end == -1:
-                    # frame incompleto
-                    buffer = buffer[start:]
-                    break
-
-                frame = buffer[start:end + 1]
-                # frame corrotto 
-                if frame.count('[') > 1: 
-                    last = frame.rfind('[') 
-                    buffer = frame[last:] + buffer 
-                    continue
-
-                buffer = buffer[end + 1:]
-
-                # validazione minima
-                if len(frame) < 8:
-                    continue
-
-                if '*' not in frame:
-                    continue
-
-                print(f"RX: {frame}", flush=True)
-
-                parse_frame(frame)
-
+            data = ser.read(64)
+            if data:
+                buffer += data.decode('ascii', errors='replace')
+                while '[' in buffer and ']' in buffer:
+                    start = buffer.find('[')
+                    end   = buffer.find(']', start)
+                    if end != -1:
+                        frame = buffer[start:end+1]
+                        buffer = buffer[end+1:]
+                        print(f"RX: {frame}", flush=True)
+                        parse_frame(frame)
+                    else:
+                        break
         except Exception as e:
-
             if running:
                 print(f"RX errore: {e}", flush=True)
-
-            time.sleep(0.05)
+            time.sleep(0.01)
 
 # ─────────────────────────────────────────
 # PARSING FRAME
 # ─────────────────────────────────────────
 def parse_frame(msg):
+    if time.time() - last_command_time < 1.0:
+        return
 
     # Risposta ST — switch/light/hybrid relè + TN223 spie + TN234 switch
     if "ST" in msg:
@@ -705,138 +651,78 @@ def parse_frame(msg):
 
     # Risposta ME — sensori analogici TN267
     if "ME" in msg:
-
         for board_id, info in detected_boards.items():
-
             if info["type"] != "hybrid":
                 continue
-
             mm = info["machine"]
             aa = info["address"]
-
             if mm in msg and f"{mm}{aa}" in msg:
-
                 try:
-
-                    # Sensore A
-                    pos_a = msg.find("A+")
-
-                    if pos_a == -1:
-                        pos_a = msg.find("A-")
-
-                    if pos_a != -1:
-
-                        val_a = msg[pos_a:pos_a + 6]
-
-                        if len(val_a) == 6:
-                            publish_sensor_value(board_id, 1, val_a)
-
-                    # Sensore B
-                    pos_b = msg.find("B+")
-
-                    if pos_b == -1:
-                        pos_b = msg.find("B-")
-
-                    if pos_b != -1:
-
-                        val_b = msg[pos_b:pos_b + 6]
-
-                        if len(val_b) == 6:
-                            publish_sensor_value(board_id, 2, val_b)
-
+                    for prefix_a in ["A+", "A-"]:
+                        if prefix_a in msg:
+                            idx = msg.find(prefix_a)
+                            raw = msg[idx:idx+7]
+                            val = ''.join(c for c in raw if c in '0123456789+-.')
+                            val = val[:6]
+                            if val:
+                                publish_sensor_value(board_id, 1, val)
+                            break
+                    for prefix_b in ["B+", "B-"]:
+                        if prefix_b in msg:
+                            idx = msg.find(prefix_b)
+                            raw = msg[idx:idx+10]
+                            val = ''.join(c for c in raw if c in '0123456789+-.')
+                            val = val[:7]
+                            if val:
+                                publish_sensor_value(board_id, 2, val)
+                            break
                 except Exception as e:
-
                     print(f"  Parse ME errore: {e}", flush=True)
-
                 break
 
 # ─────────────────────────────────────────
 # THREAD HEARTBEAT
 # ─────────────────────────────────────────
 def heartbeat_thread():
-
     ping_counter = 0
-    cycle = 0
-
     mqtt_ready.wait()
-
     time.sleep(2)
-
     print("Heartbeat avviato.", flush=True)
-
-    board_list = []
-
     while running:
-
         time.sleep(1)
-
         if scanning:
             continue
-
+        if time.time() - last_command_time < 2:
+            continue
         if not tx_queue.empty():
             continue
-
-        board_list = list(detected_boards.items())
-
-        if not board_list:
-            continue
-
-        # ping generale
         nn = f"{ping_counter:02d}"
-
         body = f"P{nn}KK"
-
         cs = checksum(body)
-
         tx_queue.put(f"[{body}*{cs}]")
-
         ping_counter = (ping_counter + 1) % 100
-
-        # UNA SOLA SCHEDA PER CICLO
-        board_id, info = board_list[cycle % len(board_list)]
-
-        mm = info["machine"]
-        aa = info["address"]
-
-        try:
-
-            # SWITCH / LIGHT
+        time.sleep(0.2)
+        for board_id, info in detected_boards.items():
             if info["type"] in ["switch", "light"]:
-
-                tx_queue.put(build_frame("Q", mm, aa, "ST"))
-
-                if cycle % 5 == 0:
-                    tx_queue.put(build_frame("Q", mm, aa, "FB"))
-
-            # HYBRID
+                tx_queue.put(build_frame("Q", info["machine"], info["address"], "ST"))
+                tx_queue.put(build_frame("Q", info["machine"], info["address"], "FB"))
             elif info["type"] == "hybrid":
-
-                tx_queue.put(build_frame("Q", mm, aa, "ST"))
-
-                if cycle % 3 == 0:
-                    tx_queue.put(build_frame("Q", mm, aa, "FB"))
-
-                if cycle % 10 == 0:
-                    tx_queue.put(build_frame("Q", mm, aa, "ME"))
-
-            # STATUS
+                tx_queue.put(build_frame("Q", info["machine"], info["address"], "ME"))
+                tx_queue.put(build_frame("Q", info["machine"], info["address"], "ST"))
+                tx_queue.put(build_frame("Q", info["machine"], info["address"], "FB"))
+                tx_queue.put(build_frame("Q", info["machine"], info["address"], "CO"))
             elif info["type"] == "status":
-
-                tx_queue.put(build_frame("Q", mm, aa, "ST"))
-
-            # ALARM
+                tx_queue.put(build_frame("Q", info["machine"], info["address"], "ST"))
             elif info["type"] == "alarm":
-
-                if cycle % 3 == 0:
-                    tx_queue.put(build_frame("Q", mm, aa, "AS"))
-
-                tx_queue.put(build_frame("Q", mm, aa, "ST"))
-
-        except Exception as e:
-
-            print(f"Heartbeat errore: {e}", flush=True)
-
-        cycle += 1
+                tx_queue.put(build_frame("Q", info["machine"], info["address"], "AS"))
+                tx_queue.put(build_frame("Q", info["machine"], info["address"], "LS"))
+                tx_queue.put(build_frame("Q", info["machine"], info["address"], "ST"))
+                tx_queue.put(build_frame("Q", info["machine"], info["address"], "FB"))
+            time.sleep(0.1)
+        for _ in range(50):
+            if not running:
+                break
+            time.sleep(0.1)
 
 # ─────────────────────────────────────────
 # MQTT
@@ -912,8 +798,6 @@ def on_message(client, userdata, msg):
                             del burst_active[burst_key]
                 else:
                     tx_queue.put(build_frame("S", mm, aa, f"P{relay_num}"))
-                    tx_queue.put(build_frame("Q", mm, aa, "ST"))
-                    tx_queue.put(build_frame("Q", mm, aa, "FB"))
             else:
                 print(f"  {board_id}/rele{relay_num} già {payload}", flush=True)
             return
@@ -930,8 +814,6 @@ def on_message(client, userdata, msg):
                 publish_switch_alarm_state(board_id, sw_num, vuole_on)
                 last_command_time = time.time()
                 tx_queue.put(build_frame("S", mm, aa, f"P{sw_num}"))
-                tx_queue.put(build_frame("Q", mm, aa, "ST"))
-                tx_queue.put(build_frame("Q", mm, aa, "FB"))
             else:
                 print(f"  {board_id}/switch{sw_num} già {payload}", flush=True)
             return
@@ -966,8 +848,6 @@ def on_message(client, userdata, msg):
                         del burst_active[burst_key]
             else:
                 tx_queue.put(build_frame("S", mm, aa, f"P{ch}"))
-                tx_queue.put(build_frame("Q", mm, aa, "ST"))
-                tx_queue.put(build_frame("Q", mm, aa, "FB"))
         else:
             print(f"  {board_id}/canale{ch} già {payload}", flush=True)
 
