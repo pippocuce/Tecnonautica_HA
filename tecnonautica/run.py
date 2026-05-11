@@ -759,9 +759,12 @@ def heartbeat_thread():
     cycle = 0
 
     mqtt_ready.wait()
+
     time.sleep(2)
 
     print("Heartbeat avviato.", flush=True)
+
+    board_list = []
 
     while running:
 
@@ -773,27 +776,36 @@ def heartbeat_thread():
         if not tx_queue.empty():
             continue
 
+        board_list = list(detected_boards.items())
+
+        if not board_list:
+            continue
+
+        # ping generale
         nn = f"{ping_counter:02d}"
+
         body = f"P{nn}KK"
+
         cs = checksum(body)
 
         tx_queue.put(f"[{body}*{cs}]")
 
         ping_counter = (ping_counter + 1) % 100
 
-        cycle += 1
+        # UNA SOLA SCHEDA PER CICLO
+        board_id, info = board_list[cycle % len(board_list)]
 
-        for board_id, info in detected_boards.items():
+        mm = info["machine"]
+        aa = info["address"]
 
-            mm = info["machine"]
-            aa = info["address"]
+        try:
 
             # SWITCH / LIGHT
             if info["type"] in ["switch", "light"]:
 
                 tx_queue.put(build_frame("Q", mm, aa, "ST"))
 
-                if cycle % 3 == 0:
+                if cycle % 5 == 0:
                     tx_queue.put(build_frame("Q", mm, aa, "FB"))
 
             # HYBRID
@@ -801,14 +813,11 @@ def heartbeat_thread():
 
                 tx_queue.put(build_frame("Q", mm, aa, "ST"))
 
-                if cycle % 2 == 0:
+                if cycle % 3 == 0:
                     tx_queue.put(build_frame("Q", mm, aa, "FB"))
 
-                if cycle % 5 == 0:
-                    tx_queue.put(build_frame("Q", mm, aa, "ME"))
-
                 if cycle % 10 == 0:
-                    tx_queue.put(build_frame("Q", mm, aa, "CO"))
+                    tx_queue.put(build_frame("Q", mm, aa, "ME"))
 
             # STATUS
             elif info["type"] == "status":
@@ -818,12 +827,16 @@ def heartbeat_thread():
             # ALARM
             elif info["type"] == "alarm":
 
-                if cycle % 2 == 0:
+                if cycle % 3 == 0:
                     tx_queue.put(build_frame("Q", mm, aa, "AS"))
 
                 tx_queue.put(build_frame("Q", mm, aa, "ST"))
 
-            time.sleep(0.03)
+        except Exception as e:
+
+            print(f"Heartbeat errore: {e}", flush=True)
+
+        cycle += 1
 
 # ─────────────────────────────────────────
 # MQTT
