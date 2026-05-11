@@ -689,11 +689,11 @@ def heartbeat_thread():
     time.sleep(2)
     print("Heartbeat avviato.", flush=True)
     while running:
-        time.sleep(1)
+        time.sleep(0.2)                       # più reattivo di sleep(1)
         if scanning:
             continue
-        if time.time() - last_command_time < 2:
-            continue
+        # RIMOSSO: if time.time() - last_command_time < 2: continue
+        # Questo bloccava TUTTO il polling per 2s dopo ogni comando!
         if not tx_queue.empty():
             continue
         nn = f"{ping_counter:02d}"
@@ -718,8 +718,9 @@ def heartbeat_thread():
                 tx_queue.put(build_frame("Q", info["machine"], info["address"], "LS"))
                 tx_queue.put(build_frame("Q", info["machine"], info["address"], "ST"))
                 tx_queue.put(build_frame("Q", info["machine"], info["address"], "FB"))
-            time.sleep(0.1)
-        for _ in range(50):
+            # RIMOSSO: time.sleep(0.1) — inutile, il tx_thread gestisce già i tempi
+        # Pausa ridotta da 5 secondi a 1 secondo
+        for _ in range(10):
             if not running:
                 break
             time.sleep(0.1)
