@@ -457,7 +457,7 @@ def do_scan():
 # ─────────────────────────────────────────
 def tx_thread():
     TX_INTERFRAME_DELAY = 0.05
-    TX_POST_QUERY_DELAY = 0.08
+    TX_POST_QUERY_DELAY = 0.20
     while running:
         try:
             frame = tx_queue.get(timeout=0.1)
@@ -846,7 +846,6 @@ def on_message(client, userdata, msg):
                         del burst_active[burst_key]
             else:
                 tx_queue.put(build_frame("S", mm, aa, f"P{ch}"))
-                tx_queue.put(build_frame("Q", mm, aa, "ST"))
         else:
             print(f"  {board_id}/canale{ch} già {payload}", flush=True)
 
