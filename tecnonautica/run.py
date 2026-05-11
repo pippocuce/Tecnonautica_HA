@@ -530,6 +530,11 @@ def rx_thread():
                     break
 
                 frame = buffer[start:end + 1]
+                # frame corrotto 
+                if frame.count('[') > 1: 
+                    last = frame.rfind('[') 
+                    buffer = frame[last:] + buffer 
+                    continue
 
                 buffer = buffer[end + 1:]
 
@@ -816,13 +821,7 @@ def heartbeat_thread():
                 if cycle % 2 == 0:
                     tx_queue.put(build_frame("Q", mm, aa, "AS"))
 
-                if cycle % 5 == 0:
-                    tx_queue.put(build_frame("Q", mm, aa, "LS"))
-
                 tx_queue.put(build_frame("Q", mm, aa, "ST"))
-
-                if cycle % 3 == 0:
-                    tx_queue.put(build_frame("Q", mm, aa, "FB"))
 
             time.sleep(0.03)
 
