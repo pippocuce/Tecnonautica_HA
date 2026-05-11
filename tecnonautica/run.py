@@ -457,7 +457,7 @@ def do_scan():
 # ─────────────────────────────────────────
 def tx_thread():
     TX_INTERFRAME_DELAY = 0.05
-    TX_POST_QUERY_DELAY = 0.20
+    TX_POST_QUERY_DELAY = 0.08
     while running:
         try:
             frame = tx_queue.get(timeout=0.1)
@@ -504,8 +504,6 @@ def rx_thread():
 # PARSING FRAME
 # ─────────────────────────────────────────
 def parse_frame(msg):
-    if time.time() - last_command_time < 1.0:
-        return
 
     # Risposta ST — switch/light/hybrid relè + TN223 spie + TN234 switch
     if "ST" in msg:
@@ -848,6 +846,7 @@ def on_message(client, userdata, msg):
                         del burst_active[burst_key]
             else:
                 tx_queue.put(build_frame("S", mm, aa, f"P{ch}"))
+                tx_queue.put(build_frame("Q", mm, aa, "ST"))
         else:
             print(f"  {board_id}/canale{ch} già {payload}", flush=True)
 
