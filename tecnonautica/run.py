@@ -504,7 +504,7 @@ def rx_thread():
 # PARSING FRAME
 # ─────────────────────────────────────────
 def parse_frame(msg):
-    if time.time() - last_command_time < 0.02:
+    if time.time() - last_command_time < 1.0:
         return
 
     # Risposta ST — switch/light/hybrid relè + TN223 spie + TN234 switch
