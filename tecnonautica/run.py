@@ -456,8 +456,8 @@ def do_scan():
 # THREAD TX
 # ─────────────────────────────────────────
 def tx_thread():
-    TX_INTERFRAME_DELAY = 0.02
-    TX_POST_QUERY_DELAY = 0.08
+    TX_INTERFRAME_DELAY = 0.05
+    TX_POST_QUERY_DELAY = 0.20
     while running:
         try:
             frame = tx_queue.get(timeout=0.1)
@@ -504,7 +504,7 @@ def rx_thread():
 # PARSING FRAME
 # ─────────────────────────────────────────
 def parse_frame(msg):
-    if time.time() - last_command_time < 0.02:
+    if time.time() - last_command_time < 0.1:
         return
 
     # Risposta ST — switch/light/hybrid relè + TN223 spie + TN234 switch
@@ -692,7 +692,7 @@ def heartbeat_thread():
         time.sleep(1)
         if scanning:
             continue
-        if time.time() - last_command_time < 0.02:
+        if time.time() - last_command_time < 2:
             continue
         if not tx_queue.empty():
             continue
