@@ -490,6 +490,7 @@ def tx_thread():
 # THREAD RX
 # ─────────────────────────────────────────
 def rx_thread():
+
     buffer = ""
 
     while running:
@@ -499,31 +500,56 @@ def rx_thread():
             continue
 
         try:
+
             data = ser.read(256)
 
-            if data:
-                buffer += data.decode('ascii', errors='replace')
+            if not data:
+                continue
 
-                while '[' in buffer and ']' in buffer:
+            chunk = data.decode('ascii', errors='ignore')
 
-                    start = buffer.find('[')
-                    end = buffer.find(']', start)
+            buffer += chunk
 
-                    if end != -1:
-                        frame = buffer[start:end+1]
-                        buffer = buffer[end+1:]
+            # evita buffer infinito
+            if len(buffer) > 2048:
+                buffer = buffer[-1024:]
 
-                        print(f"RX: {frame}", flush=True)
+            while True:
 
-                        parse_frame(frame)
-                    else:
-                        break
+                start = buffer.find('[')
+
+                if start == -1:
+                    buffer = ""
+                    break
+
+                end = buffer.find(']', start)
+
+                if end == -1:
+                    # frame incompleto
+                    buffer = buffer[start:]
+                    break
+
+                frame = buffer[start:end + 1]
+
+                buffer = buffer[end + 1:]
+
+                # validazione minima
+                if len(frame) < 8:
+                    continue
+
+                if '*' not in frame:
+                    continue
+
+                print(f"RX: {frame}", flush=True)
+
+                parse_frame(frame)
 
         except Exception as e:
+
             if running:
                 print(f"RX errore: {e}", flush=True)
 
-            time.sleep(0.01)
+            time.sleep(0.05)
 
 # ─────────────────────────────────────────
 # PARSING FRAME
@@ -674,34 +700,50 @@ def parse_frame(msg):
 
     # Risposta ME — sensori analogici TN267
     if "ME" in msg:
-        for board_id, info in detected_boards.items():
-            if info["type"] != "hybrid":
-                continue
-            mm = info["machine"]
-            aa = info["address"]
-            if mm in msg and f"{mm}{aa}" in msg:
-                try:
-                    for prefix_a in ["A+", "A-"]:
-                        if prefix_a in msg:
-                            idx = msg.find(prefix_a)
-                            raw = msg[idx:idx+7]
-                            val = ''.join(c for c in raw if c in '0123456789+-.')
-                            val = val[:6]
-                            if val:
-                                publish_sensor_value(board_id, 1, val)
-                            break
-                    for prefix_b in ["B+", "B-"]:
-                        if prefix_b in msg:
-                            idx = msg.find(prefix_b)
-                            raw = msg[idx:idx+10]
-                            val = ''.join(c for c in raw if c in '0123456789+-.')
-                            val = val[:7]
-                            if val:
-                                publish_sensor_value(board_id, 2, val)
-                            break
-                except Exception as e:
-                    print(f"  Parse ME errore: {e}", flush=True)
-                break
+
+    for board_id, info in detected_boards.items():
+
+        if info["type"] != "hybrid":
+            continue
+
+        mm = info["machine"]
+        aa = info["address"]
+
+        if mm in msg and f"{mm}{aa}" in msg:
+
+            try:
+
+                # Sensore A
+                pos_a = msg.find("A+")
+
+                if pos_a == -1:
+                    pos_a = msg.find("A-")
+
+                if pos_a != -1:
+
+                    val_a = msg[pos_a:pos_a + 6]
+
+                    if len(val_a) == 6:
+                        publish_sensor_value(board_id, 1, val_a)
+
+                # Sensore B
+                pos_b = msg.find("B+")
+
+                if pos_b == -1:
+                    pos_b = msg.find("B-")
+
+                if pos_b != -1:
+
+                    val_b = msg[pos_b:pos_b + 6]
+
+                    if len(val_b) == 6:
+                        publish_sensor_value(board_id, 2, val_b)
+
+            except Exception as e:
+
+                print(f"  Parse ME errore: {e}", flush=True)
+
+            break
 
 # ─────────────────────────────────────────
 # THREAD HEARTBEAT
