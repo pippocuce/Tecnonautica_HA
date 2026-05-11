@@ -456,15 +456,19 @@ def do_scan():
 # THREAD TX
 # ─────────────────────────────────────────
 def tx_thread():
-    TX_INTERFRAME_DELAY = 0.01
-    TX_POST_QUERY_DELAY = 0.03
+
+    TX_INTERFRAME_DELAY = 0.03
+    TX_POST_QUERY_DELAY = 0.08
 
     while running:
+
         try:
-            frame = tx_queue.get(timeout=0.05)
+            frame = tx_queue.get(timeout=0.1)
 
             if not scanning:
+
                 ser.write(frame.encode('ascii'))
+
                 print(f"TX: {frame}", flush=True)
 
             tx_queue.task_done()
@@ -703,7 +707,9 @@ def parse_frame(msg):
 # THREAD HEARTBEAT
 # ─────────────────────────────────────────
 def heartbeat_thread():
+
     ping_counter = 0
+    cycle = 0
 
     mqtt_ready.wait()
     time.sleep(2)
@@ -717,9 +723,6 @@ def heartbeat_thread():
         if scanning:
             continue
 
-        if time.time() - last_command_time < 0.15:
-            continue
-
         if not tx_queue.empty():
             continue
 
@@ -731,36 +734,55 @@ def heartbeat_thread():
 
         ping_counter = (ping_counter + 1) % 100
 
-        time.sleep(0.05)
+        cycle += 1
 
         for board_id, info in detected_boards.items():
 
+            mm = info["machine"]
+            aa = info["address"]
+
+            # SWITCH / LIGHT
             if info["type"] in ["switch", "light"]:
-                tx_queue.put(build_frame("Q", info["machine"], info["address"], "ST"))
-                tx_queue.put(build_frame("Q", info["machine"], info["address"], "FB"))
 
+                tx_queue.put(build_frame("Q", mm, aa, "ST"))
+
+                if cycle % 3 == 0:
+                    tx_queue.put(build_frame("Q", mm, aa, "FB"))
+
+            # HYBRID
             elif info["type"] == "hybrid":
-                tx_queue.put(build_frame("Q", info["machine"], info["address"], "ME"))
-                tx_queue.put(build_frame("Q", info["machine"], info["address"], "ST"))
-                tx_queue.put(build_frame("Q", info["machine"], info["address"], "FB"))
-                tx_queue.put(build_frame("Q", info["machine"], info["address"], "CO"))
 
+                tx_queue.put(build_frame("Q", mm, aa, "ST"))
+
+                if cycle % 2 == 0:
+                    tx_queue.put(build_frame("Q", mm, aa, "FB"))
+
+                if cycle % 5 == 0:
+                    tx_queue.put(build_frame("Q", mm, aa, "ME"))
+
+                if cycle % 10 == 0:
+                    tx_queue.put(build_frame("Q", mm, aa, "CO"))
+
+            # STATUS
             elif info["type"] == "status":
-                tx_queue.put(build_frame("Q", info["machine"], info["address"], "ST"))
 
+                tx_queue.put(build_frame("Q", mm, aa, "ST"))
+
+            # ALARM
             elif info["type"] == "alarm":
-                tx_queue.put(build_frame("Q", info["machine"], info["address"], "AS"))
-                tx_queue.put(build_frame("Q", info["machine"], info["address"], "LS"))
-                tx_queue.put(build_frame("Q", info["machine"], info["address"], "ST"))
-                tx_queue.put(build_frame("Q", info["machine"], info["address"], "FB"))
 
-            time.sleep(0.01)
+                if cycle % 2 == 0:
+                    tx_queue.put(build_frame("Q", mm, aa, "AS"))
 
-        for _ in range(20):
-            if not running:
-                break
+                if cycle % 5 == 0:
+                    tx_queue.put(build_frame("Q", mm, aa, "LS"))
 
-            time.sleep(0.1)
+                tx_queue.put(build_frame("Q", mm, aa, "ST"))
+
+                if cycle % 3 == 0:
+                    tx_queue.put(build_frame("Q", mm, aa, "FB"))
+
+            time.sleep(0.03)
 
 # ─────────────────────────────────────────
 # MQTT
