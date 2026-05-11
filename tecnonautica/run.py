@@ -745,7 +745,7 @@ def heartbeat_thread():
             time.sleep(0.1)
 
 # ─────────────────────────────────────────
-# MQTT CALLBACKS
+# MQTT
 # ─────────────────────────────────────────
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
@@ -753,33 +753,15 @@ def on_connect(client, userdata, flags, rc):
         mqtt_client.subscribe(SCAN_TOPIC)
         mqtt_ready.set()
     else:
-        print(f"Errore connessione MQTT, codice: {rc}", flush=True)
+        print(f"Errore MQTT: {rc}", flush=True)
 
-def on_disconnect(client, userdata, rc):
-    mqtt_ready.clear()
-    if rc != 0:
-        print(f"MQTT disconnesso inaspettatamente (rc={rc}), tentativo riconnessione...", flush=True)
-
-# ─────────────────────────────────────────
-# ROUTER COMANDI MQTT
-# ─────────────────────────────────────────
-def route_mqtt_command(topic, payload):
-    """Decodifica il topic e instrada al giusto handler."""
-    parts = topic.split("/")
-    if len(parts) < 3:
+def on_message(client, userdata, msg):
+    global last_command_time
+    topic   = msg.topic
+    payload = msg.payload.decode()
+    if not payload:
         return
 
-    board_id = parts[1]
-    entity   = parts[2]   # es: "canale3", "rele1", "switch2", "cmd"
-    info     = detected_boards.get(board_id)
-    if not info:
-        return
-
-    mm = info["machine"]
-    aa = info["address"]
-    btype = info["type"]
-
-    # Scansione bus
     if topic == SCAN_TOPIC and payload == "SCAN":
         print("Scansione richiesta da HA!", flush=True)
         threading.Thread(target=do_scan, daemon=True).start()
@@ -789,203 +771,154 @@ def route_mqtt_command(topic, payload):
         print(f"  Ignoro durante init: {topic}", flush=True)
         return
 
-    # --- TN234: pulsanti speciali (clear, smoke, etc.) ---
-    if entity == "cmd" and btype == "alarm":
-        send_board_command(mm, aa, payload)
-        request_board_state(board_id, info, immediate=True)
-        return
-
-    # --- TN267: relè ---
-    if btype == "hybrid" and entity.startswith("rele"):
-        relay_num = int(entity.replace("rele", ""))
-        handle_hybrid_relay(board_id, info, relay_num, payload)
-        return
-
-    # --- TN234: switch luci ---
-    if btype == "alarm" and entity.startswith("switch"):
-        sw_num = int(entity.replace("switch", ""))
-        handle_alarm_switch(board_id, info, sw_num, payload)
-        return
-
-    # --- Switch / Light: canali ---
-    if entity.startswith("canale"):
-        ch = int(entity.replace("canale", ""))
-        handle_channel(board_id, info, ch, payload)
-        return
-
-    print(f"  Topic non gestito: {topic}", flush=True)
-
-
-# ─────────────────────────────────────────
-# HANDLER SPECIFICI
-# ─────────────────────────────────────────
-def send_board_command(mm, aa, data):
-    """Mette in coda un frame di comando (alta priorità)."""
-    cmd_queue.put(build_frame("S", mm, aa, data))
-
-def request_board_state(board_id, info, immediate=False):
-    """
-    Richiede lo stato aggiornato della scheda.
-    Se immediate=True, mette le query in testa alla coda tx
-    usando un piccolo trucco (le inserisce in coda normale ma
-    il tx_thread le prenderà subito dopo aver finito il frame corrente).
-    """
-    mm = info["machine"]
-    aa = info["address"]
-    btype = info["type"]
-
-    if btype in ["switch", "light"]:
-        tx_queue.put(build_frame("Q", mm, aa, "ST"))
-        tx_queue.put(build_frame("Q", mm, aa, "FB"))
-    elif btype == "hybrid":
-        tx_queue.put(build_frame("Q", mm, aa, "ST"))
-        tx_queue.put(build_frame("Q", mm, aa, "FB"))
-    elif btype == "status":
-        tx_queue.put(build_frame("Q", mm, aa, "ST"))
-    elif btype == "alarm":
-        tx_queue.put(build_frame("Q", mm, aa, "AS"))
-        tx_queue.put(build_frame("Q", mm, aa, "LS"))
-        tx_queue.put(build_frame("Q", mm, aa, "ST"))
-        tx_queue.put(build_frame("Q", mm, aa, "FB"))
-
-
-def handle_channel(board_id, info, ch, payload):
-    """Gestisce canali switch/light (T2, T1, SL)."""
-    mm = info["machine"]
-    aa = info["address"]
-    key = f"{board_id}_{ch}"
-    stato_attuale = channel_states.get(key, False)
-    vuole_on = (payload == "ON")
-
-    ch_modes = info.get("channel_modes", ["T"] * info["channels"])
-    mode = ch_modes[ch - 1] if ch <= len(ch_modes) else "T"
-
-    if vuole_on == stato_attuale:
-        print(f"  {board_id}/canale{ch} già {payload}", flush=True)
-        return
-
-    channel_states[key] = vuole_on
-    publish_state(board_id, ch, vuole_on)
-
-    if mode == "B":
-        burst_key = f"{board_id}_{ch}"
-        if vuole_on:
-            stop_event = threading.Event()
-            burst_active[burst_key] = stop_event
-            threading.Thread(
-                target=burst_loop,
-                args=(board_id, ch, mm, aa, stop_event),
-                daemon=True
-            ).start()
-            print(f"Burst start {board_id}/canale{ch}", flush=True)
-        else:
-            if burst_key in burst_active:
-                burst_active[burst_key].set()
-                del burst_active[burst_key]
-    else:
-        send_board_command(mm, aa, f"P{ch}")
-        request_board_state(board_id, info)
-
-
-def handle_hybrid_relay(board_id, info, relay_num, payload):
-    """Gestisce relè su scheda PM (TN267)."""
-    mm = info["machine"]
-    aa = info["address"]
-    key = f"{board_id}_relay_{relay_num}"
-    stato_attuale = channel_states.get(key, False)
-    vuole_on = (payload == "ON")
-
-    ch_modes = info.get("channel_modes", ["T"] * 6)
-    mode = ch_modes[relay_num - 1] if relay_num - 1 < len(ch_modes) else "T"
-
-    if vuole_on == stato_attuale:
-        print(f"  {board_id}/rele{relay_num} già {payload}", flush=True)
-        return
-
-    channel_states[key] = vuole_on
-    publish_relay_state(board_id, relay_num, vuole_on)
-
-    if mode == "B":
-        burst_key = f"{board_id}_relay_{relay_num}"
-        if vuole_on:
-            stop_event = threading.Event()
-            burst_active[burst_key] = stop_event
-            threading.Thread(
-                target=burst_loop,
-                args=(board_id, relay_num, mm, aa, stop_event),
-                daemon=True
-            ).start()
-            print(f"Burst start {board_id}/rele{relay_num}", flush=True)
-        else:
-            if burst_key in burst_active:
-                burst_active[burst_key].set()
-                del burst_active[burst_key]
-    else:
-        send_board_command(mm, aa, f"P{relay_num}")
-        request_board_state(board_id, info)
-
-
-def handle_alarm_switch(board_id, info, sw_num, payload):
-    """Gestisce switch luci su scheda AL (TN234)."""
-    mm = info["machine"]
-    aa = info["address"]
-    key = f"{board_id}_switch_{sw_num}"
-    stato_attuale = channel_states.get(key, False)
-    vuole_on = (payload == "ON")
-
-    if vuole_on == stato_attuale:
-        print(f"  {board_id}/switch{sw_num} già {payload}", flush=True)
-        return
-
-    channel_states[key] = vuole_on
-    publish_switch_alarm_state(board_id, sw_num, vuole_on)
-    send_board_command(mm, aa, f"P{sw_num}")
-    request_board_state(board_id, info)
-
-
-# ─────────────────────────────────────────
-# BURST (aggiornato per usare cmd_queue)
-# ─────────────────────────────────────────
-def burst_loop(board_id, ch, mm, aa, stop_event):
-    stay_frame = build_frame("S", mm, aa, f"S{ch}")
-    while not stop_event.is_set():
-        cmd_queue.put(stay_frame)
-        stop_event.wait(0.5)
-    cmd_queue.put(build_frame("S", mm, aa, f"R{ch}"))
-    # Al termine del burst, richiedi lo stato
-    time.sleep(0.1)
-    for bid, binfo in detected_boards.items():
-        if binfo["machine"] == mm and binfo["address"] == aa:
-            request_board_state(bid, binfo)
-            break
-    print(f"Burst stop {board_id}/canale{ch}", flush=True)
-
-
-# ─────────────────────────────────────────
-# SETUP MQTT CLIENT
-# ─────────────────────────────────────────
-def on_message(client, userdata, msg):
+    print(f"MQTT RX: {topic} = {payload}", flush=True)
     try:
-        topic = msg.topic
-        payload = msg.payload.decode()
-        if not payload:
+        parts    = topic.split("/")
+        board_id = parts[1]
+        info     = detected_boards.get(board_id)
+        if not info:
             return
-        print(f"MQTT RX: {topic} = {payload}", flush=True)
-        route_mqtt_command(topic, payload)
-    except Exception as e:
-        print(f"Errore gestione messaggio MQTT: {e}", flush=True)
+        mm = info["machine"]
+        aa = info["address"]
 
+        # Comando TN234
+        if len(parts) > 2 and parts[2] == "cmd":
+            last_command_time = time.time()
+            tx_queue.put(build_frame("S", mm, aa, payload))
+            return
+
+        # Comando relè TN267
+        if info["type"] == "hybrid" and len(parts) > 2 and "rele" in parts[2]:
+            relay_num = int(parts[2].replace("rele", ""))
+            key = f"{board_id}_relay_{relay_num}"
+            stato_attuale = channel_states.get(key, False)
+            vuole_on = (payload == "ON")
+            ch_modes = info.get("channel_modes", ["T"] * 6)
+            mode = ch_modes[relay_num - 1] if relay_num - 1 < len(ch_modes) else "T"
+
+            if vuole_on != stato_attuale:
+                channel_states[key] = vuole_on
+                publish_relay_state(board_id, relay_num, vuole_on)
+                last_command_time = time.time()
+
+                if mode == "B":
+                    burst_key = f"{board_id}_relay_{relay_num}"
+                    if vuole_on:
+                        stop_event = threading.Event()
+                        burst_active[burst_key] = stop_event
+                        threading.Thread(
+                            target=burst_loop,
+                            args=(board_id, relay_num, mm, aa, stop_event),
+                            daemon=True
+                        ).start()
+                        print(f"Burst start {board_id}/rele{relay_num}", flush=True)
+                    else:
+                        if burst_key in burst_active:
+                            burst_active[burst_key].set()
+                            del burst_active[burst_key]
+                else:
+                    tx_queue.put(build_frame("S", mm, aa, f"P{relay_num}"))
+            else:
+                print(f"  {board_id}/rele{relay_num} già {payload}", flush=True)
+            return
+
+        # Comando switch luci TN234
+        if info["type"] == "alarm" and len(parts) > 2 and "switch" in parts[2]:
+            sw_num = int(parts[2].replace("switch", ""))
+            key = f"{board_id}_switch_{sw_num}"
+            stato_attuale = channel_states.get(key, False)
+            vuole_on = (payload == "ON")
+            
+            if vuole_on != stato_attuale:
+                channel_states[key] = vuole_on
+                publish_switch_alarm_state(board_id, sw_num, vuole_on)
+                last_command_time = time.time()
+                tx_queue.put(build_frame("S", mm, aa, f"P{sw_num}"))
+            else:
+                print(f"  {board_id}/switch{sw_num} già {payload}", flush=True)
+            return
+
+        # Comando canale switch/light con supporto burst
+        ch = int(parts[2].replace("canale", ""))
+        key = f"{board_id}_{ch}"
+        stato_attuale = channel_states.get(key, False)
+        vuole_on = (payload == "ON")
+        ch_modes = info.get("channel_modes", ["T"] * info["channels"])
+        mode = ch_modes[ch-1] if ch <= len(ch_modes) else "T"
+
+        if vuole_on != stato_attuale:
+            channel_states[key] = vuole_on
+            publish_state(board_id, ch, vuole_on)
+            last_command_time = time.time()
+
+            if mode == "B":
+                burst_key = f"{board_id}_{ch}"
+                if vuole_on:
+                    stop_event = threading.Event()
+                    burst_active[burst_key] = stop_event
+                    threading.Thread(
+                        target=burst_loop,
+                        args=(board_id, ch, mm, aa, stop_event),
+                        daemon=True
+                    ).start()
+                    print(f"Burst start {board_id}/canale{ch}", flush=True)
+                else:
+                    if burst_key in burst_active:
+                        burst_active[burst_key].set()
+                        del burst_active[burst_key]
+            else:
+                tx_queue.put(build_frame("S", mm, aa, f"P{ch}"))
+        else:
+            print(f"  {board_id}/canale{ch} già {payload}", flush=True)
+
+    except Exception as e:
+        print(f"Errore comando: {e}", flush=True)
 
 mqtt_client = mqtt.Client()
 if MQTT_USER:
     mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
 mqtt_client.on_connect = on_connect
-mqtt_client.on_disconnect = on_disconnect
 mqtt_client.on_message = on_message
 
 print(f"Connessione MQTT {MQTT_HOST}:{MQTT_PORT}...", flush=True)
 mqtt_client.connect(MQTT_HOST, MQTT_PORT, 60)
 mqtt_client.loop_start()
 
+mqtt_ready.wait(timeout=30)
+publish_scan_button()
+
+boards = load_boards()
+if boards:
+    detected_boards = boards
+    setup_boards(boards)
+else:
+    print("Nessuna scheda salvata, avvio scansione...", flush=True)
+    detected_boards = scan_bus()
+    if not detected_boards:
+        detected_boards["T2_00"] = {
+            "machine": "T2", "address": "00",
+            "channels": 6, "type": "switch",
+            "name": "TN218 addr=00", "model": "TN218",
+        }
+    save_boards(detected_boards)
+    setup_boards(detected_boards)
+
+enable_commands_at = time.time() + 5
+print("Comandi abilitati tra 5 secondi...", flush=True)
+
+threading.Thread(target=tx_thread,        daemon=True).start()
+threading.Thread(target=rx_thread,        daemon=True).start()
+threading.Thread(target=heartbeat_thread, daemon=True).start()
+
+print("Tecnonautica bridge avviato!", flush=True)
+
+try:
+    while True:
+        time.sleep(1)
+except KeyboardInterrupt:
+    running = False
+    mqtt_client.loop_stop()
+    mqtt_client.disconnect()
+    ser.close()
 mqtt_ready.wait(timeout=30)
 publish_scan_button()
