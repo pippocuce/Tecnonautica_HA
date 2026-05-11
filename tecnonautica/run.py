@@ -456,8 +456,8 @@ def do_scan():
 # THREAD TX
 # ─────────────────────────────────────────
 def tx_thread():
-    TX_INTERFRAME_DELAY = 0.05
-    TX_POST_QUERY_DELAY = 0.20
+    TX_INTERFRAME_DELAY = 0.02   # 20ms tra frame normali (era 50ms)
+    TX_POST_QUERY_DELAY = 0.08   # 80ms dopo query, tempo sufficiente per la risposta (era 200ms)
     while running:
         try:
             frame = tx_queue.get(timeout=0.1)
@@ -495,6 +495,8 @@ def rx_thread():
                         parse_frame(frame)
                     else:
                         break
+            else:
+                time.sleep(0.005)  # 5ms sleep se non ci sono dati, evita busy-loop
         except Exception as e:
             if running:
                 print(f"RX errore: {e}", flush=True)
@@ -504,8 +506,7 @@ def rx_thread():
 # PARSING FRAME
 # ─────────────────────────────────────────
 def parse_frame(msg):
-    if time.time() - last_command_time < 1.0:
-        return
+    # Nessun blackout dopo il comando: processiamo subito le risposte delle schede
 
     # Risposta ST — switch/light/hybrid relè + TN223 spie + TN234 switch
     if "ST" in msg:
@@ -692,8 +693,6 @@ def heartbeat_thread():
         time.sleep(1)
         if scanning:
             continue
-        if time.time() - last_command_time < 2:
-            continue
         if not tx_queue.empty():
             continue
         nn = f"{ping_counter:02d}"
@@ -719,7 +718,7 @@ def heartbeat_thread():
                 tx_queue.put(build_frame("Q", info["machine"], info["address"], "ST"))
                 tx_queue.put(build_frame("Q", info["machine"], info["address"], "FB"))
             time.sleep(0.1)
-        for _ in range(50):
+        for _ in range(20):   # 2 secondi tra un ciclo di polling e il successivo (era 5s)
             if not running:
                 break
             time.sleep(0.1)
@@ -798,6 +797,9 @@ def on_message(client, userdata, msg):
                             del burst_active[burst_key]
                 else:
                     tx_queue.put(build_frame("S", mm, aa, f"P{relay_num}"))
+                    # Conferma rapida dello stato dopo il comando
+                    tx_queue.put(build_frame("Q", mm, aa, "ST"))
+                    tx_queue.put(build_frame("Q", mm, aa, "FB"))
             else:
                 print(f"  {board_id}/rele{relay_num} già {payload}", flush=True)
             return
@@ -814,6 +816,9 @@ def on_message(client, userdata, msg):
                 publish_switch_alarm_state(board_id, sw_num, vuole_on)
                 last_command_time = time.time()
                 tx_queue.put(build_frame("S", mm, aa, f"P{sw_num}"))
+                # Conferma rapida dello stato dopo il comando
+                tx_queue.put(build_frame("Q", mm, aa, "ST"))
+                tx_queue.put(build_frame("Q", mm, aa, "FB"))
             else:
                 print(f"  {board_id}/switch{sw_num} già {payload}", flush=True)
             return
@@ -848,6 +853,9 @@ def on_message(client, userdata, msg):
                         del burst_active[burst_key]
             else:
                 tx_queue.put(build_frame("S", mm, aa, f"P{ch}"))
+                # Conferma rapida dello stato dopo il comando
+                tx_queue.put(build_frame("Q", mm, aa, "ST"))
+                tx_queue.put(build_frame("Q", mm, aa, "FB"))
         else:
             print(f"  {board_id}/canale{ch} già {payload}", flush=True)
 
