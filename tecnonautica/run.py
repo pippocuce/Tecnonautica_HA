@@ -72,7 +72,7 @@ QUERIES = {
     MachineType.T1: ["ST", "FB", "CO"],
     MachineType.PM: ["ME", "ST", "FB", "CO"],
     MachineType.AL: ["AS", "LS"],
-    MachineType.SP: ["ST"],
+    #MachineType.SP: ["ST"],
     MachineType.SL: ["LS", "KB"],
 }
 
@@ -729,6 +729,8 @@ class BusController:
             for board_id, info in list(self.boards.items()):
                 if not self.cmd_queue.empty():
                     break
+                if info.btype == "status":      # <-- AGGIUNGI QUESTO
+                    continue                    #     salta TN223
                 svc = info.next_query()
                 if svc:
                     resp = self._query_board(board_id, info, svc)
