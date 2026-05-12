@@ -12,8 +12,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Callable
-from enum import Enum
+from typing import Dict, List, Optional
 
 import paho.mqtt.client as mqtt
 
@@ -54,16 +53,15 @@ class MsgType:
     ERROR   = "E"
 
 class MachineType:
-    T2 = "T2"  # TN218 - Dashboard 6ch
-    T1 = "T1"  # TN222 - Switch 10ch
-    PM = "PM"  # TN267 - Instruments 6ch + 2 sensors
-    AL = "AL"  # TN234 - Alarm 16ch
-    SP = "SP"  # TN223 - Warning Lights 10ch
-    SL = "SL"  # TN224 - Lights 6ch
+    T2 = "T2"
+    T1 = "T1"
+    PM = "PM"
+    AL = "AL"
+    SP = "SP"
+    SL = "SL"
 
 # Protocol timing: min 180ms between master frames
 MIN_INTERFRAME_MS = 180
-# Burst safety: send Sx every 500ms while key is held (protocol requirement)
 BURST_INTERVAL_MS = 500
 
 QUERIES = {
@@ -138,13 +136,9 @@ def parse_frame(raw: str) -> Optional[dict]:
         return None
     if len(body_no_kk) < 5:
         return None
-    msg_type = body_no_kk[0]
-    machine  = body_no_kk[1:3]
-    addr     = body_no_kk[3:5]
-    data     = body_no_kk[5:]
     return {
-        "raw": raw, "type": msg_type, "machine": machine,
-        "addr": addr, "data": data, "valid": True
+        "raw": raw, "type": body_no_kk[0], "machine": body_no_kk[1:3],
+        "addr": body_no_kk[3:5], "data": body_no_kk[5:], "valid": True
     }
 
 
@@ -199,6 +193,7 @@ class SerialMaster:
                     chunk = self.ser.read(64)
                     if chunk:
                         buffer += chunk.decode('ascii', errors='replace')
+                        # Parse all complete frames in buffer
                         while True:
                             start = buffer.find('[')
                             if start == -1:
@@ -212,9 +207,12 @@ class SerialMaster:
                             buffer = buffer[end+1:]
                             parsed = parse_frame(candidate)
                             if parsed:
+                                # Filter: accept only slave responses, skip echo
                                 if parsed["type"] in (MsgType.ANSWER, MsgType.CONFIRM, MsgType.RCONF, MsgType.ERROR):
                                     print(f"RX: {candidate}", flush=True)
                                     return parsed
+                                else:
+                                    print(f"  (echo skipped: {candidate})", flush=True)
                 except serial.SerialException:
                     self.ser.close()
                     self.ser = None
@@ -286,14 +284,12 @@ class MqttPublisher:
         )
 
     def anchor(self, board_id: str, _num: int, state: bool):
-        """Anchor light — _num is ignored (always 1) for compatibility with StateManager."""
         self.client.publish(
             self._topic(board_id, "anchor", "state"),
             "ON" if state else "OFF", retain=True
         )
 
     def navlights(self, board_id: str, _num: int, state: bool):
-        """Nav lights — _num is ignored (always 1) for compatibility with StateManager."""
         self.client.publish(
             self._topic(board_id, "navlights", "state"),
             "ON" if state else "OFF", retain=True
@@ -304,6 +300,7 @@ class MqttPublisher:
             self._topic("scan", "result"),
             f"Trovate {count} schede", retain=False
         )
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # HOME ASSISTANT DISCOVERY
@@ -616,26 +613,20 @@ class ResponseParser:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# BURST MANAGER  [BURST]
+# BURST MANAGER
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class BurstManager:
-    """
-    Gestisce i canali in modalità BURST (safety feature del protocollo).
-    Ogni 500ms invia Sx (stay pressed) finché non riceve OFF da HA o
-    non viene chiamato stop().
-    """
     def __init__(self, controller: 'BusController'):
         self.controller = controller
         self.active: Dict[str, threading.Event] = {}
         self.lock = threading.Lock()
 
     def start(self, board_id: str, ch: int, info: BoardInfo):
-        """Avvia il burst per un canale."""
         key = f"{board_id}_{ch}"
         with self.lock:
             if key in self.active:
-                return  # Già attivo
+                return
             stop_event = threading.Event()
             self.active[key] = stop_event
 
@@ -646,11 +637,9 @@ class BurstManager:
         def burst_loop():
             print(f"Burst START {board_id}/ch{ch}", flush=True)
             while not stop_event.is_set():
-                # [BURST] Invia Sx ogni 500ms tramite coda comandi prioritaria
                 self.controller.enqueue_command(board_id, stay_frame_data, [])
                 stop_event.wait(BURST_INTERVAL_MS / 1000)
 
-            # Burst terminato: invia Rx (release)
             self.controller.enqueue_command(board_id, f"R{ch}", ["ST", "FB"])
             print(f"Burst STOP {board_id}/ch{ch}", flush=True)
 
@@ -661,7 +650,6 @@ class BurstManager:
         thread.start()
 
     def stop(self, board_id: str, ch: int):
-        """Ferma il burst per un canale."""
         key = f"{board_id}_{ch}"
         with self.lock:
             evt = self.active.get(key)
@@ -684,7 +672,6 @@ class BusController:
         self.running = True
         self.scanning = False
         self.last_cmd_time = 0
-        # [BURST] Inizializza il gestore burst
         self.burst = BurstManager(self)
 
     def _send(self, frame: str) -> Optional[dict]:
@@ -828,7 +815,6 @@ class MqttCommandHandler:
         self.states.update(board_id, "switch", ch, want_on)
 
         if mode == "B":
-            # [BURST] Avvia burst loop per inviare Sx ogni 500ms
             if want_on:
                 self.ctrl.burst.start(board_id, ch, info)
             else:
@@ -851,7 +837,6 @@ class MqttCommandHandler:
         self.states.update(board_id, "relay", num, want_on)
 
         if mode == "B":
-            # [BURST] Avvia burst loop per relè
             if want_on:
                 self.ctrl.burst.start(board_id, num, info)
             else:
@@ -1006,7 +991,11 @@ class TecnonauticaGateway:
             print(f"Errore MQTT message: {e}", flush=True)
 
     def _setup_mqtt(self):
-        self.mqtt_client = mqtt.Client()
+        # FIX: paho-mqtt v2 compatibility
+        try:
+            self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
+        except (AttributeError, TypeError):
+            self.mqtt_client = mqtt.Client()
         if MQTT_USER:
             self.mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
         self.mqtt_client.on_connect = self._on_mqtt_connect
