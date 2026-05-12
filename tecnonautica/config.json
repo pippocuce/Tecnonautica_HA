@@ -1,6 +1,6 @@
 {
   "name": "Tecnonautica",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "slug": "tecnonautica",
   "description": "Sistema di automazione Tecnonautica - Bridge RS485 per Home Assistant",
   "arch": ["aarch64", "amd64", "armhf", "armv7", "i386"],
