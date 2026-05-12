@@ -64,6 +64,7 @@ class MachineType:
 MIN_INTERFRAME_MS = 180
 BURST_INTERVAL_MS = 500
 
+# Query services per machine type (rotated one per cycle for speed)
 QUERIES = {
     MachineType.T2: ["ST", "FB", "CO"],
     MachineType.T1: ["ST", "FB", "CO"],
@@ -89,12 +90,22 @@ class BoardInfo:
     sensors:    int = 0
     lights:     int = 0
     channel_modes: List[str] = field(default_factory=list)
+    _poll_index: int = field(default=0, repr=False)  # internal rotation
 
     def board_id(self) -> str:
         return f"{self.machine}_{self.address}"
 
     def display_name(self) -> str:
         return BOARD_NAMES.get(self.board_id(), self.model)
+
+    def next_query(self) -> Optional[str]:
+        """Return next query service in rotation."""
+        services = QUERIES.get(self.machine, [])
+        if not services:
+            return None
+        svc = services[self._poll_index % len(services)]
+        self._poll_index += 1
+        return svc
 
 
 MACHINE_META = {
@@ -159,7 +170,7 @@ class SerialMaster:
             try:
                 self.ser = serial.Serial(
                     self.port, self.baud,
-                    timeout=0.5,
+                    timeout=0.3,  # shorter timeout for faster polling
                     write_timeout=1.0
                 )
                 self.ser.reset_input_buffer()
@@ -173,7 +184,7 @@ class SerialMaster:
         if self.ser is None or not self.ser.is_open:
             self._connect()
 
-    def send_and_receive(self, frame: str, timeout: float = 0.8) -> Optional[dict]:
+    def send_and_receive(self, frame: str, timeout: float = 0.5) -> Optional[dict]:
         with self.lock:
             self._ensure_connected()
             try:
@@ -193,7 +204,6 @@ class SerialMaster:
                     chunk = self.ser.read(64)
                     if chunk:
                         buffer += chunk.decode('ascii', errors='replace')
-                        # Parse all complete frames in buffer
                         while True:
                             start = buffer.find('[')
                             if start == -1:
@@ -207,12 +217,11 @@ class SerialMaster:
                             buffer = buffer[end+1:]
                             parsed = parse_frame(candidate)
                             if parsed:
-                                # Filter: accept only slave responses, skip echo
                                 if parsed["type"] in (MsgType.ANSWER, MsgType.CONFIRM, MsgType.RCONF, MsgType.ERROR):
                                     print(f"RX: {candidate}", flush=True)
                                     return parsed
                                 else:
-                                    print(f"  (echo skipped: {candidate})", flush=True)
+                                    print(f"  (echo: {candidate})", flush=True)
                 except serial.SerialException:
                     self.ser.close()
                     self.ser = None
@@ -630,8 +639,6 @@ class BurstManager:
             stop_event = threading.Event()
             self.active[key] = stop_event
 
-        mm = info.machine
-        aa = info.address
         stay_frame_data = f"S{ch}"
 
         def burst_loop():
@@ -658,7 +665,7 @@ class BurstManager:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# BUS CONTROLLER — HEARTBEAT & COMMAND PROCESSING
+# BUS CONTROLLER — OPTIMIZED HEARTBEAT & COMMAND PROCESSING
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class BusController:
@@ -674,8 +681,8 @@ class BusController:
         self.last_cmd_time = 0
         self.burst = BurstManager(self)
 
-    def _send(self, frame: str) -> Optional[dict]:
-        return self.master.send_and_receive(frame)
+    def _send(self, frame: str, timeout: float = 0.5) -> Optional[dict]:
+        return self.master.send_and_receive(frame, timeout)
 
     def _query_board(self, board_id: str, info: BoardInfo, service: str) -> Optional[dict]:
         frame = build_frame(MsgType.QUERY, info.machine, info.address, service)
@@ -683,24 +690,18 @@ class BusController:
 
     def _command_board(self, board_id: str, info: BoardInfo, data: str) -> bool:
         frame = build_frame(MsgType.COMMAND, info.machine, info.address, data)
-        resp = self._send(frame)
+        resp = self._send(frame, timeout=0.8)  # longer timeout for commands
         if resp and resp["type"] in (MsgType.CONFIRM, MsgType.ANSWER):
             self.last_cmd_time = time.time()
             return True
         return False
 
-    def _poll_board(self, board_id: str, info: BoardInfo):
-        for svc in QUERIES.get(info.machine, []):
-            resp = self._query_board(board_id, info, svc)
-            if resp:
-                self.parser.parse(resp)
-            time.sleep(MIN_INTERFRAME_MS / 1000)
-
     def run(self):
+        """Main loop: process commands immediately, poll one query per cycle."""
         while self.running:
             # ── HIGH PRIORITY: Commands from HA ──
             try:
-                cmd = self.cmd_queue.get(timeout=0.05)
+                cmd = self.cmd_queue.get(timeout=0.02)  # very short check
                 board_id, info, data, post_queries = cmd
                 if not self.scanning:
                     print(f"CMD: {board_id} -> {data}", flush=True)
@@ -716,18 +717,28 @@ class BusController:
                 pass
 
             if self.scanning:
-                time.sleep(0.1)
+                time.sleep(0.05)
                 continue
 
-            # Ping
-            ping_n = int(time.time() * 10) % 100
-            ping_frame = build_frame(MsgType.PING, "", "", f"{ping_n:02d}")
-            self._send(ping_frame)
-            time.sleep(MIN_INTERFRAME_MS / 1000)
+            # ── FAST POLLING: one query per board per cycle ──
+            for board_id, info in list(self.boards.items()):
+                # Check for commands between boards
+                try:
+                    cmd = self.cmd_queue.get(timeout=0.001)
+                    self.cmd_queue.put(cmd)  # put back, will be processed at top of loop
+                    break
+                except queue.Empty:
+                    pass
 
-            # Poll all boards
-            for board_id, info in self.boards.items():
-                self._poll_board(board_id, info)
+                svc = info.next_query()
+                if svc:
+                    resp = self._query_board(board_id, info, svc)
+                    if resp:
+                        self.parser.parse(resp)
+                time.sleep(MIN_INTERFRAME_MS / 1000)
+
+            # Very short pause between cycles
+            time.sleep(0.05)
 
     def stop(self):
         self.running = False
@@ -768,8 +779,6 @@ class MqttCommandHandler:
         if not info:
             return
 
-        mm = info.machine
-        aa = info.address
         btype = info.btype
 
         if btype == "alarm":
@@ -801,7 +810,6 @@ class MqttCommandHandler:
         print(f"  Unhandled: {topic} = {payload}", flush=True)
 
     def _handle_switch(self, board_id: str, info: BoardInfo, ch: int, payload: str):
-        key = f"{board_id}_switch_{ch}"
         current = self.states.get(board_id, "switch", ch) or False
         want_on = payload == "ON"
 
@@ -823,7 +831,6 @@ class MqttCommandHandler:
             self.ctrl.enqueue_command(board_id, f"P{ch}", ["ST", "FB"])
 
     def _handle_relay(self, board_id: str, info: BoardInfo, num: int, payload: str):
-        key = f"{board_id}_relay_{num}"
         current = self.states.get(board_id, "relay", num) or False
         want_on = payload == "ON"
 
@@ -991,7 +998,7 @@ class TecnonauticaGateway:
             print(f"Errore MQTT message: {e}", flush=True)
 
     def _setup_mqtt(self):
-        # FIX: paho-mqtt v2 compatibility
+        # FIX: try paho-mqtt v2, fallback to v1
         try:
             self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
         except (AttributeError, TypeError):
