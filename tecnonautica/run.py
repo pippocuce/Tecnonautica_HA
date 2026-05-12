@@ -11,8 +11,12 @@ import time
 import json
 import os
 import re
+import warnings
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
+
+# Suppress paho-mqtt v2 deprecation warning BEFORE importing
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="paho.mqtt.client")
 
 import paho.mqtt.client as mqtt
 
@@ -60,11 +64,9 @@ class MachineType:
     SP = "SP"
     SL = "SL"
 
-# Protocol timing: min 180ms between master frames
 MIN_INTERFRAME_MS = 180
 BURST_INTERVAL_MS = 500
 
-# Query services per machine type (rotated one per cycle for speed)
 QUERIES = {
     MachineType.T2: ["ST", "FB", "CO"],
     MachineType.T1: ["ST", "FB", "CO"],
@@ -90,7 +92,7 @@ class BoardInfo:
     sensors:    int = 0
     lights:     int = 0
     channel_modes: List[str] = field(default_factory=list)
-    _poll_index: int = field(default=0, repr=False)  # internal rotation
+    _poll_index: int = field(default=0, repr=False)
 
     def board_id(self) -> str:
         return f"{self.machine}_{self.address}"
@@ -99,7 +101,6 @@ class BoardInfo:
         return BOARD_NAMES.get(self.board_id(), self.model)
 
     def next_query(self) -> Optional[str]:
-        """Return next query service in rotation."""
         services = QUERIES.get(self.machine, [])
         if not services:
             return None
@@ -154,7 +155,7 @@ def parse_frame(raw: str) -> Optional[dict]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SERIAL I/O — SYNCHRONOUS MASTER WITH RESPONSE
+# SERIAL I/O
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class SerialMaster:
@@ -170,7 +171,7 @@ class SerialMaster:
             try:
                 self.ser = serial.Serial(
                     self.port, self.baud,
-                    timeout=0.3,  # shorter timeout for faster polling
+                    timeout=0.3,
                     write_timeout=1.0
                 )
                 self.ser.reset_input_buffer()
@@ -246,69 +247,44 @@ class MqttPublisher:
         return "/".join(["tecnonautica"] + list(parts))
 
     def switch(self, board_id: str, ch: int, state: bool):
-        self.client.publish(
-            self._topic(board_id, f"canale{ch}", "state"),
-            "ON" if state else "OFF", retain=True
-        )
+        self.client.publish(self._topic(board_id, f"canale{ch}", "state"),
+                           "ON" if state else "OFF", retain=True)
 
     def light(self, board_id: str, ch: int, state: bool):
-        self.client.publish(
-            self._topic(board_id, f"luce{ch}", "state"),
-            "ON" if state else "OFF", retain=True
-        )
+        self.client.publish(self._topic(board_id, f"luce{ch}", "state"),
+                           "ON" if state else "OFF", retain=True)
 
     def relay(self, board_id: str, num: int, state: bool):
-        self.client.publish(
-            self._topic(board_id, f"rele{num}", "state"),
-            "ON" if state else "OFF", retain=True
-        )
+        self.client.publish(self._topic(board_id, f"rele{num}", "state"),
+                           "ON" if state else "OFF", retain=True)
 
     def feedback(self, board_id: str, num: int, state: bool):
-        self.client.publish(
-            self._topic(board_id, f"fb{num}", "state"),
-            "ON" if state else "OFF", retain=True
-        )
+        self.client.publish(self._topic(board_id, f"fb{num}", "state"),
+                           "ON" if state else "OFF", retain=True)
 
     def alarm(self, board_id: str, ch: int, raw: str):
         state = "ON" if raw in ("A", "C") else "OFF"
-        self.client.publish(
-            self._topic(board_id, f"allarme{ch}", "state"),
-            state, retain=True
-        )
-        self.client.publish(
-            self._topic(board_id, f"allarme{ch}", "raw"),
-            raw, retain=True
-        )
+        self.client.publish(self._topic(board_id, f"allarme{ch}", "state"), state, retain=True)
+        self.client.publish(self._topic(board_id, f"allarme{ch}", "raw"), raw, retain=True)
 
     def sensor(self, board_id: str, num: int, value: str):
-        self.client.publish(
-            self._topic(board_id, f"sensore{num}", "state"),
-            value, retain=True
-        )
+        self.client.publish(self._topic(board_id, f"sensore{num}", "state"), value, retain=True)
 
     def spia(self, board_id: str, ch: int, state: bool):
-        self.client.publish(
-            self._topic(board_id, f"spia{ch}", "state"),
-            "ON" if state else "OFF", retain=True
-        )
+        self.client.publish(self._topic(board_id, f"spia{ch}", "state"),
+                           "ON" if state else "OFF", retain=True)
 
     def anchor(self, board_id: str, _num: int, state: bool):
-        self.client.publish(
-            self._topic(board_id, "anchor", "state"),
-            "ON" if state else "OFF", retain=True
-        )
+        self.client.publish(self._topic(board_id, "anchor", "state"),
+                           "ON" if state else "OFF", retain=True)
 
     def navlights(self, board_id: str, _num: int, state: bool):
-        self.client.publish(
-            self._topic(board_id, "navlights", "state"),
-            "ON" if state else "OFF", retain=True
-        )
+        self.client.publish(self._topic(board_id, "navlights", "state"),
+                           "ON" if state else "OFF", retain=True)
 
     def scan_result(self, count: int):
-        self.client.publish(
-            self._topic("scan", "result"),
-            f"Trovate {count} schede", retain=False
-        )
+        self.client.publish(self._topic("scan", "result"),
+                           f"Trovate {count} schede", retain=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -429,19 +405,16 @@ class Discovery:
 
     def setup_board(self, board_id: str, info: BoardInfo):
         btype = info.btype
-
         if btype == "switch":
             for ch in range(1, info.channels + 1):
                 self.switch(board_id, info, ch)
             for fb in range(1, info.feedback + 1):
                 self.binary_sensor(board_id, info, fb, "Stato", "fb", "power")
-
         elif btype == "light":
             for ch in range(1, info.channels + 1):
                 self.light_entity(board_id, info, ch)
             for fb in range(1, info.feedback + 1):
                 self.binary_sensor(board_id, info, fb, "Stato", "fb", "power")
-
         elif btype == "hybrid":
             for s in range(1, info.sensors + 1):
                 self.sensor(board_id, info, s)
@@ -449,11 +422,9 @@ class Discovery:
                 self.relay(board_id, info, r)
             for fb in range(1, info.feedback + 1):
                 self.binary_sensor(board_id, info, fb, "Stato", "fb", "power")
-
         elif btype == "status":
             for ch in range(1, info.channels + 1):
                 self.binary_sensor(board_id, info, ch, "Spia", "spia", "power")
-
         elif btype == "alarm":
             for ch in range(1, info.channels + 1):
                 self.alarm_sensor(board_id, info, ch)
@@ -527,11 +498,9 @@ class ResponseParser:
         addr = frame["addr"]
         data = frame["data"]
         board_id = f"{mm}_{addr}"
-
         info = self.boards.get(board_id)
         if not info:
             return False
-
         btype = info.btype
 
         if frame["type"] == MsgType.ANSWER:
@@ -646,10 +615,8 @@ class BurstManager:
             while not stop_event.is_set():
                 self.controller.enqueue_command(board_id, stay_frame_data, [])
                 stop_event.wait(BURST_INTERVAL_MS / 1000)
-
             self.controller.enqueue_command(board_id, f"R{ch}", ["ST", "FB"])
             print(f"Burst STOP {board_id}/ch{ch}", flush=True)
-
             with self.lock:
                 self.active.pop(key, None)
 
@@ -665,7 +632,7 @@ class BurstManager:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# BUS CONTROLLER — CORRETTO CON PING E DEPRECATION FIX
+# BUS CONTROLLER
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class BusController:
@@ -698,7 +665,6 @@ class BusController:
         return False
 
     def run(self):
-        """Main loop: process commands immediately, poll one query per cycle, ping every 30s."""
         while self.running:
             # ── HIGH PRIORITY: Commands from HA ──
             try:
@@ -729,14 +695,12 @@ class BusController:
                 self._send(ping_frame)
                 self.last_ping_time = now
                 time.sleep(MIN_INTERFRAME_MS / 1000)
-                continue  # skip one poll cycle after ping
+                continue
 
             # ── FAST POLLING: one query per board per cycle ──
             for board_id, info in list(self.boards.items()):
-                # Check for commands between boards (non-blocking)
                 if not self.cmd_queue.empty():
-                    break  # will be processed at top of loop
-
+                    break
                 svc = info.next_query()
                 if svc:
                     resp = self._query_board(board_id, info, svc)
@@ -744,7 +708,6 @@ class BusController:
                         self.parser.parse(resp)
                 time.sleep(MIN_INTERFRAME_MS / 1000)
 
-            # Very short pause between cycles
             time.sleep(0.05)
 
     def stop(self):
@@ -756,6 +719,7 @@ class BusController:
         if not info:
             return
         self.cmd_queue.put((board_id, info, data, post_queries or []))
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MQTT COMMAND HANDLER
@@ -771,7 +735,6 @@ class MqttCommandHandler:
     def handle(self, topic: str, payload: str):
         if not payload:
             return
-
         if topic == SCAN_TOPIC and payload == "SCAN":
             return
 
@@ -818,16 +781,12 @@ class MqttCommandHandler:
     def _handle_switch(self, board_id: str, info: BoardInfo, ch: int, payload: str):
         current = self.states.get(board_id, "switch", ch) or False
         want_on = payload == "ON"
-
         if want_on == current:
             print(f"  {board_id}/canale{ch} already {payload}", flush=True)
             return
-
         modes = info.channel_modes or ["T"] * info.channels
         mode = modes[ch - 1] if ch <= len(modes) else "T"
-
         self.states.update(board_id, "switch", ch, want_on)
-
         if mode == "B":
             if want_on:
                 self.ctrl.burst.start(board_id, ch, info)
@@ -839,16 +798,12 @@ class MqttCommandHandler:
     def _handle_relay(self, board_id: str, info: BoardInfo, num: int, payload: str):
         current = self.states.get(board_id, "relay", num) or False
         want_on = payload == "ON"
-
         if want_on == current:
             print(f"  {board_id}/rele{num} already {payload}", flush=True)
             return
-
         modes = info.channel_modes or ["T"] * info.channels
         mode = modes[num - 1] if num <= len(modes) else "T"
-
         self.states.update(board_id, "relay", num, want_on)
-
         if mode == "B":
             if want_on:
                 self.ctrl.burst.start(board_id, num, info)
@@ -860,11 +815,9 @@ class MqttCommandHandler:
     def _handle_light(self, board_id: str, info: BoardInfo, ch: int, payload: str):
         current = self.states.get(board_id, "light", ch) or False
         want_on = payload == "ON"
-
         if want_on == current:
             print(f"  {board_id}/luce{ch} already {payload}", flush=True)
             return
-
         self.states.update(board_id, "light", ch, want_on)
         if want_on:
             self.ctrl.enqueue_command(board_id, f"A{ch}", ["LS"])
@@ -955,7 +908,7 @@ def load_boards() -> Optional[Dict[str, BoardInfo]]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN APPLICATION — FIX DEPRECATION WARNING
+# MAIN APPLICATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TecnonauticaGateway:
@@ -990,24 +943,16 @@ class TecnonauticaGateway:
             payload = msg.payload.decode()
             if not payload:
                 return
-
             print(f"MQTT RX: {topic} = {payload}", flush=True)
-
             if topic == SCAN_TOPIC and payload == "SCAN":
                 threading.Thread(target=self._do_scan, daemon=True).start()
                 return
-
             if self.handler:
                 self.handler.handle(topic, payload)
-
         except Exception as e:
             print(f"Errore MQTT message: {e}", flush=True)
 
     def _setup_mqtt(self):
-        # FIX: suppress deprecation warning for older paho-mqtt versions
-        import warnings
-        warnings.filterwarnings("ignore", category=DeprecationWarning, module="paho.mqtt.client")
-        
         try:
             self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
         except (AttributeError, TypeError):
@@ -1017,7 +962,6 @@ class TecnonauticaGateway:
         self.mqtt_client.on_connect = self._on_mqtt_connect
         self.mqtt_client.on_disconnect = self._on_mqtt_disconnect
         self.mqtt_client.on_message = self._on_mqtt_message
-
         print(f"Connessione MQTT {MQTT_HOST}:{MQTT_PORT}...", flush=True)
         self.mqtt_client.connect(MQTT_HOST, MQTT_PORT, 60)
         self.mqtt_client.loop_start()
@@ -1035,23 +979,18 @@ class TecnonauticaGateway:
             return
         self.scanning = True
         print("Avvio scansione...", flush=True)
-
         scanner = BusScanner(self.master)
         found = scanner.scan()
-
         if not found:
             found["T2_00"] = BoardInfo(
                 machine="T2", address="00", channels=6,
                 btype="switch", model="TN218", feedback=6
             )
-
         self.boards = found
         save_boards(found)
         self._setup_boards(found)
-
         if self.controller:
             self.controller.boards = found
-
         self.scanning = False
         if self.states:
             self.states.pub.scan_result(len(found))
