@@ -285,13 +285,15 @@ class MqttPublisher:
             "ON" if state else "OFF", retain=True
         )
 
-    def anchor(self, board_id: str, state: bool):
+    def anchor(self, board_id: str, _num: int, state: bool):
+        """Anchor light — _num is ignored (always 1) for compatibility with StateManager."""
         self.client.publish(
             self._topic(board_id, "anchor", "state"),
             "ON" if state else "OFF", retain=True
         )
 
-    def navlights(self, board_id: str, state: bool):
+    def navlights(self, board_id: str, _num: int, state: bool):
+        """Nav lights — _num is ignored (always 1) for compatibility with StateManager."""
         self.client.publish(
             self._topic(board_id, "navlights", "state"),
             "ON" if state else "OFF", retain=True
@@ -302,7 +304,6 @@ class MqttPublisher:
             self._topic("scan", "result"),
             f"Trovate {count} schede", retain=False
         )
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # HOME ASSISTANT DISCOVERY
