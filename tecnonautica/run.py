@@ -665,7 +665,7 @@ class BurstManager:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# BUS CONTROLLER — OPTIMIZED HEARTBEAT & COMMAND PROCESSING
+# BUS CONTROLLER — CORRETTO CON PING E DEPRECATION FIX
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class BusController:
@@ -679,6 +679,7 @@ class BusController:
         self.running = True
         self.scanning = False
         self.last_cmd_time = 0
+        self.last_ping_time = 0
         self.burst = BurstManager(self)
 
     def _send(self, frame: str, timeout: float = 0.5) -> Optional[dict]:
@@ -690,18 +691,18 @@ class BusController:
 
     def _command_board(self, board_id: str, info: BoardInfo, data: str) -> bool:
         frame = build_frame(MsgType.COMMAND, info.machine, info.address, data)
-        resp = self._send(frame, timeout=0.8)  # longer timeout for commands
+        resp = self._send(frame, timeout=0.8)
         if resp and resp["type"] in (MsgType.CONFIRM, MsgType.ANSWER):
             self.last_cmd_time = time.time()
             return True
         return False
 
     def run(self):
-        """Main loop: process commands immediately, poll one query per cycle."""
+        """Main loop: process commands immediately, poll one query per cycle, ping every 30s."""
         while self.running:
             # ── HIGH PRIORITY: Commands from HA ──
             try:
-                cmd = self.cmd_queue.get(timeout=0.02)  # very short check
+                cmd = self.cmd_queue.get(timeout=0.02)
                 board_id, info, data, post_queries = cmd
                 if not self.scanning:
                     print(f"CMD: {board_id} -> {data}", flush=True)
@@ -720,15 +721,21 @@ class BusController:
                 time.sleep(0.05)
                 continue
 
+            # ── PING every 30 seconds ──
+            now = time.time()
+            if now - self.last_ping_time >= 30:
+                ping_n = int(now * 10) % 100
+                ping_frame = build_frame(MsgType.PING, "", "", f"{ping_n:02d}")
+                self._send(ping_frame)
+                self.last_ping_time = now
+                time.sleep(MIN_INTERFRAME_MS / 1000)
+                continue  # skip one poll cycle after ping
+
             # ── FAST POLLING: one query per board per cycle ──
             for board_id, info in list(self.boards.items()):
-                # Check for commands between boards
-                try:
-                    cmd = self.cmd_queue.get(timeout=0.001)
-                    self.cmd_queue.put(cmd)  # put back, will be processed at top of loop
-                    break
-                except queue.Empty:
-                    pass
+                # Check for commands between boards (non-blocking)
+                if not self.cmd_queue.empty():
+                    break  # will be processed at top of loop
 
                 svc = info.next_query()
                 if svc:
@@ -749,7 +756,6 @@ class BusController:
         if not info:
             return
         self.cmd_queue.put((board_id, info, data, post_queries or []))
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MQTT COMMAND HANDLER
@@ -949,7 +955,7 @@ def load_boards() -> Optional[Dict[str, BoardInfo]]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN APPLICATION
+# MAIN APPLICATION — FIX DEPRECATION WARNING
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TecnonauticaGateway:
@@ -998,7 +1004,10 @@ class TecnonauticaGateway:
             print(f"Errore MQTT message: {e}", flush=True)
 
     def _setup_mqtt(self):
-        # FIX: try paho-mqtt v2, fallback to v1
+        # FIX: suppress deprecation warning for older paho-mqtt versions
+        import warnings
+        warnings.filterwarnings("ignore", category=DeprecationWarning, module="paho.mqtt.client")
+        
         try:
             self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
         except (AttributeError, TypeError):
