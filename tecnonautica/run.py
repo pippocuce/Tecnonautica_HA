@@ -452,26 +452,35 @@ class Discovery:
                 self.binary_sensor(board_id, info, fb, "Stato", "fb", "power")
             self.button(board_id, info, "clear", "Azzera Allarmi", "CL")
             self.button(board_id, info, "smoke", "Reset Fumo", "SM")
-        def subscribe_commands(self, client: mqtt.Client, board_id: str, info: BoardInfo):
-            """Subscribe to MQTT command topics for a board."""
-            btype = info.btype
-            if btype == "switch":
-                for ch in range(1, info.channels + 1):
-                    client.subscribe(f"tecnonautica/{board_id}/canale{ch}/set")
-            elif btype == "light":
-                for ch in range(1, info.channels + 1):
-                    client.subscribe(f"tecnonautica/{board_id}/luce{ch}/set")
-            elif btype == "hybrid":
-                for r in range(1, info.channels + 1):
-                    client.subscribe(f"tecnonautica/{board_id}/rele{r}/set")
-            elif btype == "alarm":
-                if info.lights >= 1:
-                    client.subscribe(f"tecnonautica/{board_id}/anchor/set")
-                if info.lights >= 2:
-                    client.subscribe(f"tecnonautica/{board_id}/navlights/set")
-                client.subscribe(f"tecnonautica/{board_id}/cmd")
-            # SP (status) has no commands
 
+    # ═════════════════════════════════════════════════════════════════
+    # NUOVO: Subscribe ai topic di comando
+    # ═════════════════════════════════════════════════════════════════
+    def subscribe_commands(self, client: mqtt.Client, board_id: str, info: BoardInfo):
+        """Subscribe to MQTT command topics for a board."""
+        btype = info.btype
+        if btype == "switch":
+            for ch in range(1, info.channels + 1):
+                client.subscribe(f"tecnonautica/{board_id}/canale{ch}/set")
+                print(f"  Sub: {board_id}/canale{ch}/set", flush=True)
+        elif btype == "light":
+            for ch in range(1, info.channels + 1):
+                client.subscribe(f"tecnonautica/{board_id}/luce{ch}/set")
+                print(f"  Sub: {board_id}/luce{ch}/set", flush=True)
+        elif btype == "hybrid":
+            for r in range(1, info.channels + 1):
+                client.subscribe(f"tecnonautica/{board_id}/rele{r}/set")
+                print(f"  Sub: {board_id}/rele{r}/set", flush=True)
+        elif btype == "alarm":
+            if info.lights >= 1:
+                client.subscribe(f"tecnonautica/{board_id}/anchor/set")
+                print(f"  Sub: {board_id}/anchor/set", flush=True)
+            if info.lights >= 2:
+                client.subscribe(f"tecnonautica/{board_id}/navlights/set")
+                print(f"  Sub: {board_id}/navlights/set", flush=True)
+            client.subscribe(f"tecnonautica/{board_id}/cmd")
+            print(f"  Sub: {board_id}/cmd", flush=True)
+        # SP (status) has no commands
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STATE MANAGER
