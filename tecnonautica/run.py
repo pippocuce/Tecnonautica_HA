@@ -1,332 +1,837 @@
+```python
 import serial
+import time
 import threading
 import queue
-import time
-import paho.mqtt.client as mqtt
+import re
 import json
-import os
+import signal
+import sys
 
-# ─────────────────────────────────────────
-# CONFIGURAZIONE E COSTANTI
-# ─────────────────────────────────────────
-with open("/data/options.json") as f:
-    config = json.load(f)
+import paho.mqtt.client as mqtt
 
-PORT      = config.get("serial_port", "/dev/ttyUSB0")
-BAUD      = 19200
-MQTT_HOST = config.get("mqtt_host", "core-mosquitto")
-MQTT_PORT = config.get("mqtt_port", 1883)
-MQTT_USER = config.get("mqtt_user", "")
-MQTT_PASS = config.get("mqtt_pass", "")
-BOARD_NAMES = config.get("board_names", {})
+# ============================================================
+# CONFIG
+# ============================================================
 
-BOARDS_FILE = "/data/boards.json"
-SCAN_TOPIC  = "tecnonautica/scan"
+SERIAL_PORT = "/dev/ttyUSB0"
+BAUDRATE = 19200
+SERIAL_TIMEOUT = 0.05
 
-MACHINE_TYPES = {
-    "T2": {"name": "TN218",  "channels": 6,  "type": "switch",  "feedback": 6},
-    "T1": {"name": "TN222",  "channels": 10, "type": "switch",  "feedback": 10},
-    "PM": {"name": "TN267",  "channels": 6,  "type": "hybrid",  "feedback": 6},
-    "AL": {"name": "TN234",  "channels": 16, "type": "alarm",   "feedback": 4, "switches": 4},
-    "SP": {"name": "TN223",  "channels": 10, "type": "status",  "feedback": 0},
-    "SL": {"name": "TN224",  "channels": 6,  "type": "light",   "feedback": 6},
+MQTT_HOST = "core-mosquitto"
+MQTT_PORT = 1883
+MQTT_USER = "prova"
+MQTT_PASSWORD = "prova"
+
+MQTT_BASE = "tecnonautica"
+
+TX_DELAY = 0.20
+
+# ============================================================
+# SCHEDE
+# ============================================================
+
+BOARDS = {
+
+    "PM_01": {
+        "machine": "PM",
+        "address": "01",
+        "type": "pm",
+        "relays": 6,
+        "feedbacks": 6,
+        "sensors": 2
+    },
+
+    "PM_02": {
+        "machine": "PM",
+        "address": "02",
+        "type": "pm",
+        "relays": 6,
+        "feedbacks": 6,
+        "sensors": 2
+    },
+
+    "SP_03": {
+        "machine": "SP",
+        "address": "03",
+        "type": "sp",
+        "channels": 10
+    },
+
+    "T1_04": {
+        "machine": "T1",
+        "address": "04",
+        "type": "t1",
+        "relays": 10,
+        "feedbacks": 10
+    },
+
+    "SP_06": {
+        "machine": "SP",
+        "address": "06",
+        "type": "sp",
+        "channels": 10
+    },
+
+    "AL_07": {
+        "machine": "AL",
+        "address": "07",
+        "type": "al",
+        "alarms": 16
+    },
+
+    "T1_09": {
+        "machine": "T1",
+        "address": "09",
+        "type": "t1",
+        "relays": 10,
+        "feedbacks": 10
+    }
 }
 
-detected_boards    = {}
-running            = True
-scanning           = False
-channel_states     = {}
-last_command_time  = 0
-enable_commands_at = time.time() + 5
-# PriorityQueue: 0=Comandi (Urgenti), 1=Query post-comando, 2=Heartbeat (Routine)
-tx_queue           = queue.PriorityQueue()
-mqtt_ready         = threading.Event()
-burst_active       = {}
-last_sensor_values = {}
+# ============================================================
+# GLOBALS
+# ============================================================
 
-# Timeout ridotto a 0.05 per migliorare la reattività con chip CH340
-ser = serial.Serial(PORT, BAUD, timeout=0.05)
+running = True
+
+tx_queue = queue.Queue()
+
+last_states = {}
+last_seen = {}
+
+serial_lock = threading.Lock()
+
+mqtt_ready = threading.Event()
+
+# ============================================================
+# SERIAL
+# ============================================================
+
+ser = serial.Serial(
+    SERIAL_PORT,
+    BAUDRATE,
+    timeout=SERIAL_TIMEOUT
+)
+
+# ============================================================
+# CHECKSUM
+# ============================================================
 
 def checksum(data):
-    cs = 0
-    for c in data: cs ^= ord(c)
-    return format(cs, "02X")
 
-def build_frame(msg_type, machine, addr, data):
-    body = f"{msg_type}{machine}{addr}{data}KK"
-    return f"[{body}*{checksum(body)}]"
+    c = 0
 
-def send_direct(frame, timeout=0.3):
-    ser.reset_input_buffer()
-    ser.write(frame.encode('ascii'))
-    buffer = ""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        data = ser.read(64)
-        if data:
-            buffer += data.decode('ascii', errors='replace')
-            if '[' in buffer and ']' in buffer:
-                start = buffer.find('[')
-                end   = buffer.find(']', start)
-                if end != -1: return buffer[start:end+1]
-    return None
+    for ch in data:
+        c ^= ord(ch)
 
-def board_display_name(board_id, board_info):
-    return BOARD_NAMES.get(board_id, board_info["name"])
+    return f"{c:02X}"
 
-# ─────────────────────────────────────────
-# PUBBLICAZIONE STATI MQTT
-# ─────────────────────────────────────────
-def publish_state(board_id, ch_num, stato):
-    mqtt_client.publish(f"tecnonautica/{board_id}/canale{ch_num}/state", "ON" if stato else "OFF", retain=True)
+# ============================================================
+# BUILD FRAME
+# ============================================================
 
-def publish_relay_state(board_id, relay_num, stato):
-    mqtt_client.publish(f"tecnonautica/{board_id}/rele{relay_num}/state", "ON" if stato else "OFF", retain=True)
+def build_frame(msg_type, mm, aa, payload):
 
-def publish_alarm_state(board_id, ch_num, stato):
-    mqtt_client.publish(f"tecnonautica/{board_id}/allarme{ch_num}/state", "ON" if stato in ["A", "C"] else "OFF", retain=True)
-    mqtt_client.publish(f"tecnonautica/{board_id}/allarme{ch_num}/raw", stato, retain=True)
+    body = f"{msg_type}{mm}{aa}{payload}KK"
 
-def publish_sensor_value(board_id, ch_num, value):
-    if not value or value.strip() in ["", "0", "0000"]: return
-    mqtt_client.publish(f"tecnonautica/{board_id}/sensore{ch_num}/state", str(value), retain=True)
-    last_sensor_values[f"{board_id}_{ch_num}"] = value
+    cs = checksum(body)
 
-def publish_feedback_state(board_id, fb_num, stato):
-    mqtt_client.publish(f"tecnonautica/{board_id}/fb{fb_num}/state", "ON" if stato else "OFF", retain=True)
+    return f"[{body}*{cs}]"
 
-def publish_spia_state(board_id, ch_num, stato):
-    mqtt_client.publish(f"tecnonautica/{board_id}/spia{ch_num}/state", "ON" if stato else "OFF", retain=True)
+# ============================================================
+# MQTT
+# ============================================================
 
-def publish_switch_alarm_state(board_id, sw_num, stato):
-    mqtt_client.publish(f"tecnonautica/{board_id}/switch{sw_num}/state", "ON" if stato else "OFF", retain=True)
+mqtt_client = mqtt.Client(
+    mqtt.CallbackAPIVersion.VERSION2
+)
 
-# ─────────────────────────────────────────
-# DISCOVERY E GESTIONE FILES
-# ─────────────────────────────────────────
-def save_boards(boards):
-    with open(BOARDS_FILE, "w") as f: json.dump(boards, f, indent=2)
+mqtt_client.username_pw_set(
+    MQTT_USER,
+    MQTT_PASSWORD
+)
 
-def load_boards():
-    if os.path.exists(BOARDS_FILE):
-        with open(BOARDS_FILE) as f: return json.load(f)
-    return None
+# ============================================================
+# MQTT PUBLISH
+# ============================================================
 
-def scan_bus():
-    global scanning
-    scanning = True
-    time.sleep(0.2)
-    found = {}
-    for mm, info in MACHINE_TYPES.items():
-        for addr in range(33):
-            aa = f"{addr:02d}"
-            resp = send_direct(build_frame("Q", mm, aa, "ID"), timeout=0.2)
-            if resp and "ID" in resp and mm in resp:
-                board_id = f"{mm}_{aa}"
-                found[board_id] = {
-                    "machine": mm, "address": aa, "channels": info["channels"],
-                    "type": info["type"], "name": f"{info['name']} addr={aa}",
-                    "model": info["name"], "feedback": info.get("feedback", 0),
-                    "switches": info.get("switches", 0),
+def mqtt_publish(topic, payload, retain=True):
+
+    mqtt_client.publish(
+        topic,
+        payload,
+        qos=0,
+        retain=retain
+    )
+
+# ============================================================
+# MQTT DISCOVERY
+# ============================================================
+
+def publish_discovery():
+
+    for board_id, info in BOARDS.items():
+
+        # RELAY
+        if info["type"] in ["pm", "t1"]:
+
+            channels = info["relays"]
+
+            for ch in range(1, channels + 1):
+
+                uid = f"{board_id}_relay_{ch}"
+
+                topic = f"homeassistant/switch/{uid}/config"
+
+                payload = {
+                    "name": f"{board_id} Relay {ch}",
+                    "uniq_id": uid,
+                    "cmd_t": f"{MQTT_BASE}/{board_id}/relay{ch}/set",
+                    "stat_t": f"{MQTT_BASE}/{board_id}/relay{ch}/state"
                 }
-    scanning = False
-    return found
 
-# ─────────────────────────────────────────
-# THREAD TX (GESTORE PRIORITÀ)
-# ─────────────────────────────────────────
-def tx_thread():
-    while running:
-        try:
-            priority, frame = tx_queue.get(timeout=0.1)
-            
-            # Se è routine (P2) ma c'è stato un comando recente, scartiamo per liberare il bus
-            if priority == 2 and (time.time() - last_command_time < 1.5):
-                tx_queue.task_done()
-                continue
+                mqtt_publish(
+                    topic,
+                    json.dumps(payload)
+                )
 
-            if not scanning:
-                ser.reset_input_buffer()
-                ser.write(frame.encode('ascii'))
-                ser.flush()
-            
-            tx_queue.task_done()
-            # Timing aggressivo: 80ms per query, 40ms per comandi
-            time.sleep(0.08 if "Q" in frame else 0.04)
-        except queue.Empty: pass
+        # FEEDBACK
+        if info["type"] in ["pm", "t1"]:
 
-# ─────────────────────────────────────────
-# THREAD RX E PARSING
-# ─────────────────────────────────────────
-def rx_thread():
-    buffer = ""
-    while running:
-        if scanning: 
-            time.sleep(0.1)
-            continue
-        try:
-            data = ser.read(64)
-            if data:
-                buffer += data.decode('ascii', errors='replace')
-                while '[' in buffer and ']' in buffer:
-                    start = buffer.find('[')
-                    end   = buffer.find(']', start)
-                    if end != -1:
-                        parse_frame(buffer[start:end+1])
-                        buffer = buffer[end+1:]
-                    else: break
-        except: time.sleep(0.01)
+            channels = info["feedbacks"]
 
-def parse_frame(msg):
-    # Ignora feedback seriali durante l'invio comandi
-    if time.time() - last_command_time < 0.1: return
+            for ch in range(1, channels + 1):
 
-    if "ST" in msg or "FB" in msg or "AS" in msg or "LS" in msg or "ME" in msg or "CO" in msg:
-        for board_id, info in detected_boards.items():
-            mm, aa = info["machine"], info["address"]
-            if f"{mm}{aa}" not in msg: continue
+                uid = f"{board_id}_feedback_{ch}"
 
-            try:
-                if "ST" in msg:
-                    idx = msg.find("ST") + 2
-                    stati = "".join(c for c in msg[idx:idx+20] if c in "01")
-                    if info["type"] == "hybrid":
-                        for i in range(min(6, len(stati))):
-                            key, val = f"{board_id}_relay_{i+1}", (stati[i] == "1")
-                            if val != channel_states.get(key): 
-                                channel_states[key] = val
-                                publish_relay_state(board_id, i+1, val)
-                    elif info["type"] == "status":
-                        for i in range(min(info["channels"], len(stati))):
-                            key, val = f"{board_id}_spia_{i+1}", (stati[i] == "1")
-                            if val != channel_states.get(key):
-                                channel_states[key] = val
-                                publish_spia_state(board_id, i+1, val)
-                    else:
-                        for i in range(min(info["channels"], len(stati))):
-                            key, val = f"{board_id}_{i+1}", (stati[i] == "1")
-                            if val != channel_states.get(key):
-                                channel_states[key] = val
-                                publish_state(board_id, i+1, val)
+                topic = f"homeassistant/binary_sensor/{uid}/config"
 
-                if "FB" in msg:
-                    idx = msg.find("FB") + 2
-                    stati = "".join(c for c in msg[idx:idx+20] if c in "01")
-                    for i in range(min(info.get("feedback", 0), len(stati))):
-                        key, val = f"{board_id}_fb_{i+1}", (stati[i] == "1")
-                        if val != channel_states.get(key):
-                            channel_states[key] = val
-                            publish_feedback_state(board_id, i+1, val)
+                payload = {
+                    "name": f"{board_id} Feedback {ch}",
+                    "uniq_id": uid,
+                    "stat_t": f"{MQTT_BASE}/{board_id}/feedback{ch}/state",
+                    "pl_on": "ON",
+                    "pl_off": "OFF"
+                }
 
-                if "AS" in msg and info["type"] == "alarm":
-                    idx = msg.find("AS") + 2
-                    for i, s in enumerate(msg[idx:idx+info["channels"]]):
-                        if s in "DA CRN": publish_alarm_state(board_id, i+1, s)
+                mqtt_publish(
+                    topic,
+                    json.dumps(payload)
+                )
 
-                if "ME" in msg and info["type"] == "hybrid":
-                    for p, ch in [("A", 1), ("B", 2)]:
-                        if p in msg:
-                            idx = msg.find(p)
-                            val = "".join(c for c in msg[idx:idx+10] if c in "0123456789+-.")
-                            publish_sensor_value(board_id, ch, val[:7])
+        # STATUS
+        if info["type"] == "sp":
 
-            except Exception as e: print(f"Errore parsing: {e}")
+            channels = info["channels"]
 
-# ─────────────────────────────────────────
-# HEARTBEAT (ROUTINE)
-# ─────────────────────────────────────────
-def heartbeat_thread():
-    ping = 0
-    mqtt_ready.wait()
-    while running:
-        if scanning or (time.time() - last_command_time < 2.0):
-            time.sleep(0.5)
-            continue
-        
-        # PING di sistema
-        tx_queue.put((2, build_frame("P", f"{ping:02d}", "00", "KK")))
-        ping = (ping + 1) % 100
-        
-        # Polling stati
-        for board_id, info in detected_boards.items():
-            mm, aa = info["machine"], info["address"]
-            tx_queue.put((2, build_frame("Q", mm, aa, "ST")))
-            if info.get("feedback", 0) > 0:
-                tx_queue.put((2, build_frame("Q", mm, aa, "FB")))
-            if info["type"] == "hybrid":
-                tx_queue.put((2, build_frame("Q", mm, aa, "ME")))
-            time.sleep(0.1)
-        time.sleep(5)
+            for ch in range(1, channels + 1):
 
-# ─────────────────────────────────────────
-# MQTT E COMANDI REATTIVI
-# ─────────────────────────────────────────
+                uid = f"{board_id}_status_{ch}"
+
+                topic = f"homeassistant/binary_sensor/{uid}/config"
+
+                payload = {
+                    "name": f"{board_id} Status {ch}",
+                    "uniq_id": uid,
+                    "stat_t": f"{MQTT_BASE}/{board_id}/status{ch}/state",
+                    "pl_on": "ON",
+                    "pl_off": "OFF"
+                }
+
+                mqtt_publish(
+                    topic,
+                    json.dumps(payload)
+                )
+
+        # SENSORI ANALOGICI
+        if info["type"] == "pm":
+
+            for s in range(1, 3):
+
+                uid = f"{board_id}_sensor_{s}"
+
+                topic = f"homeassistant/sensor/{uid}/config"
+
+                payload = {
+                    "name": f"{board_id} Sensor {s}",
+                    "uniq_id": uid,
+                    "stat_t": f"{MQTT_BASE}/{board_id}/sensor{s}/state"
+                }
+
+                mqtt_publish(
+                    topic,
+                    json.dumps(payload)
+                )
+
+        # ALLARMI
+        if info["type"] == "al":
+
+            for a in range(1, 17):
+
+                uid = f"{board_id}_alarm_{a}"
+
+                topic = f"homeassistant/binary_sensor/{uid}/config"
+
+                payload = {
+                    "name": f"{board_id} Alarm {a}",
+                    "uniq_id": uid,
+                    "stat_t": f"{MQTT_BASE}/{board_id}/alarm{a}/state",
+                    "pl_on": "ON",
+                    "pl_off": "OFF"
+                }
+
+                mqtt_publish(
+                    topic,
+                    json.dumps(payload)
+                )
+
+# ============================================================
+# MQTT CONNECT
+# ============================================================
+
+def on_connect(client, userdata, flags, reason_code, properties):
+
+    print("MQTT connected", flush=True)
+
+    mqtt_ready.set()
+
+    client.subscribe(f"{MQTT_BASE}/+/+/set")
+
+    publish_discovery()
+
+# ============================================================
+# MQTT MESSAGE
+# ============================================================
+
 def on_message(client, userdata, msg):
-    global last_command_time
-    topic, payload = msg.topic, msg.payload.decode()
-    if not payload or time.time() < enable_commands_at: return
 
-    if topic == SCAN_TOPIC and payload == "SCAN":
-        threading.Thread(target=do_scan, daemon=True).start()
+    topic = msg.topic
+
+    payload = msg.payload.decode().strip().upper()
+
+    print(f"MQTT RX: {topic} = {payload}", flush=True)
+
+    parts = topic.split("/")
+
+    if len(parts) < 4:
         return
 
-    try:
-        parts = topic.split("/")
-        board_id = parts[1]
-        info = detected_boards.get(board_id)
-        if not info: return
+    board_id = parts[1]
+    entity = parts[2]
 
-        # BLOCCO IMMEDIATO DEL TRAFFICO DI ROUTINE
-        last_command_time = time.time()
+    if board_id not in BOARDS:
+        return
 
-        # SVUOTA LA CODA ISTANTANEAMENTE
-        while not tx_queue.empty():
-            try: tx_queue.get_nowait(); tx_queue.task_done()
-            except: break
+    info = BOARDS[board_id]
 
-        mm, aa = info["machine"], info["address"]
-        
-        if "rele" in parts[2] or "canale" in parts[2] or "switch" in parts[2]:
-            ch_str = "".join(filter(str.isdigit, parts[2]))
-            ch = int(ch_str)
-            
-            # INVIA COMANDO (Priorità 0 - Massima)
-            tx_queue.put((0, build_frame("S", mm, aa, f"P{ch}")))
-            
-            # CHIEDI STATO IMMEDIATO (Priorità 1) per feedback visivo in HA
-            tx_queue.put((1, build_frame("Q", mm, aa, "ST")))
-            tx_queue.put((1, build_frame("Q", mm, aa, "FB")))
-            
-            print(f"HA -> TX [PRIO 0]: {board_id} CH{ch} {payload}")
+    mm = info["machine"]
+    aa = info["address"]
 
-    except Exception as e: print(f"Errore MQTT: {e}")
+    m = re.match(r"relay(\d+)", entity)
 
-# ─────────────────────────────────────────
-# AVVIO SISTEMA
-# ─────────────────────────────────────────
-mqtt_client = mqtt.Client()
-if MQTT_USER: mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
-mqtt_client.on_connect = lambda c,u,f,rc: (mqtt_client.subscribe(SCAN_TOPIC), mqtt_ready.set())
+    if m:
+
+        ch = int(m.group(1))
+
+        if ch == 10:
+            key = "0"
+        else:
+            key = str(ch)
+
+        if payload == "ON":
+
+            tx_queue.put(
+                build_frame("S", mm, aa, f"P{key}")
+            )
+
+        elif payload == "OFF":
+
+            tx_queue.put(
+                build_frame("S", mm, aa, f"R{key}")
+            )
+
+        # refresh stato
+        tx_queue.put(
+            build_frame("Q", mm, aa, "ST")
+        )
+
+# ============================================================
+# MQTT SETUP
+# ============================================================
+
+mqtt_client.on_connect = on_connect
 mqtt_client.on_message = on_message
-mqtt_client.connect(MQTT_HOST, MQTT_PORT, 60)
+
+mqtt_client.connect(
+    MQTT_HOST,
+    MQTT_PORT,
+    60
+)
+
 mqtt_client.loop_start()
 
-boards = load_boards()
-if boards:
-    detected_boards = boards
-    # Qui andrebbero i tuoi cicli publish_discovery_... (omessi per brevità)
-else:
-    detected_boards = scan_bus()
-    save_boards(detected_boards)
+# ============================================================
+# TX THREAD
+# ============================================================
 
-threading.Thread(target=tx_thread,        daemon=True).start()
-threading.Thread(target=rx_thread,        daemon=True).start()
-threading.Thread(target=heartbeat_thread, daemon=True).start()
+def tx_thread():
 
-print("Tecnonautica Bridge ULTRA-REATTIVO avviato!", flush=True)
+    while running:
 
-try:
-    while True: time.sleep(1)
-except:
+        try:
+
+            frame = tx_queue.get(timeout=0.1)
+
+            with serial_lock:
+
+                ser.write(
+                    frame.encode("ascii")
+                )
+
+            print(f"TX: {frame}", flush=True)
+
+            tx_queue.task_done()
+
+            # IMPORTANTISSIMO:
+            # protocollo richiede >180ms
+            time.sleep(TX_DELAY)
+
+        except queue.Empty:
+            pass
+
+        except Exception as e:
+
+            print(f"TX error: {e}", flush=True)
+
+            time.sleep(1)
+
+# ============================================================
+# PARSE ST
+# ============================================================
+
+def parse_st(board_id, states, prefix):
+
+    for i, state in enumerate(states):
+
+        ch = i + 1
+
+        value = "ON" if state == "1" else "OFF"
+
+        topic = f"{MQTT_BASE}/{board_id}/{prefix}{ch}/state"
+
+        old = last_states.get(topic)
+
+        if old != value:
+
+            last_states[topic] = value
+
+            mqtt_publish(topic, value)
+
+            print(
+                f"HA <- {board_id}/{prefix}{ch} = {value}",
+                flush=True
+            )
+
+# ============================================================
+# PARSE ME
+# ============================================================
+
+def parse_me(board_id, frame):
+
+    match_a = re.search(
+        r"A([+-]\d{5})",
+        frame
+    )
+
+    match_b = re.search(
+        r"B([+-]\d{5})",
+        frame
+    )
+
+    if match_a:
+
+        mqtt_publish(
+            f"{MQTT_BASE}/{board_id}/sensor1/state",
+            match_a.group(1)
+        )
+
+    if match_b:
+
+        mqtt_publish(
+            f"{MQTT_BASE}/{board_id}/sensor2/state",
+            match_b.group(1)
+        )
+
+# ============================================================
+# PARSE ALARMS
+# ============================================================
+
+def parse_alarms(board_id, alarms):
+
+    for i, a in enumerate(alarms):
+
+        ch = i + 1
+
+        active = a in ["A", "C"]
+
+        value = "ON" if active else "OFF"
+
+        topic = f"{MQTT_BASE}/{board_id}/alarm{ch}/state"
+
+        old = last_states.get(topic)
+
+        if old != value:
+
+            last_states[topic] = value
+
+            mqtt_publish(topic, value)
+
+            print(
+                f"HA <- {board_id}/alarm{ch} = {value}",
+                flush=True
+            )
+
+# ============================================================
+# PARSE FRAME
+# ============================================================
+
+def parse_frame(frame):
+
+    print(f"RX: {frame}", flush=True)
+
+    for board_id, info in BOARDS.items():
+
+        mm = info["machine"]
+        aa = info["address"]
+
+        sig = f"{mm}{aa}"
+
+        if sig not in frame:
+            continue
+
+        last_seen[board_id] = time.time()
+
+        # PM/T1 ST
+        m = re.search(r"ST([01]{6,10})", frame)
+
+        if m:
+
+            if info["type"] in ["pm", "t1"]:
+
+                parse_st(
+                    board_id,
+                    m.group(1),
+                    "relay"
+                )
+
+            elif info["type"] == "sp":
+
+                parse_st(
+                    board_id,
+                    m.group(1),
+                    "status"
+                )
+
+        # FEEDBACK
+        m = re.search(r"FB([01]{6,10})", frame)
+
+        if m:
+
+            parse_st(
+                board_id,
+                m.group(1),
+                "feedback"
+            )
+
+        # ANALOG
+        if "ME" in frame:
+
+            parse_me(
+                board_id,
+                frame
+            )
+
+        # ALARMS
+        m = re.search(r"AS([DACRN]{16})", frame)
+
+        if m:
+
+            parse_alarms(
+                board_id,
+                m.group(1)
+            )
+
+        return
+
+# ============================================================
+# RX THREAD
+# ============================================================
+
+def rx_thread():
+
+    buffer = ""
+
+    while running:
+
+        try:
+
+            data = ser.read(256)
+
+            if not data:
+                continue
+
+            chunk = data.decode(
+                "ascii",
+                errors="ignore"
+            )
+
+            buffer += chunk
+
+            if len(buffer) > 4096:
+                buffer = buffer[-1024:]
+
+            while True:
+
+                start = buffer.find("[")
+
+                if start == -1:
+
+                    buffer = ""
+
+                    break
+
+                end = buffer.find("]", start)
+
+                if end == -1:
+
+                    buffer = buffer[start:]
+
+                    break
+
+                frame = buffer[start:end + 1]
+
+                buffer = buffer[end + 1:]
+
+                # recovery frame concatenati
+                if frame.count("[") > 1:
+
+                    last = frame.rfind("[")
+
+                    buffer = frame[last:] + buffer
+
+                    continue
+
+                if "*" not in frame:
+                    continue
+
+                parse_frame(frame)
+
+        except Exception as e:
+
+            print(f"RX error: {e}", flush=True)
+
+            time.sleep(1)
+
+# ============================================================
+# HEARTBEAT
+# ============================================================
+
+def heartbeat_thread():
+
+    mqtt_ready.wait()
+
+    time.sleep(2)
+
+    print("Heartbeat started", flush=True)
+
+    cycle = 0
+
+    poll_list = []
+
+    while running:
+
+        try:
+
+            poll_list.clear()
+
+            for board_id, info in BOARDS.items():
+
+                mm = info["machine"]
+                aa = info["address"]
+
+                # stato principale
+                poll_list.append(
+                    build_frame(
+                        "Q",
+                        mm,
+                        aa,
+                        "ST"
+                    )
+                )
+
+                # feedback
+                if info["type"] in ["pm", "t1"]:
+
+                    if cycle % 3 == 0:
+
+                        poll_list.append(
+                            build_frame(
+                                "Q",
+                                mm,
+                                aa,
+                                "FB"
+                            )
+                        )
+
+                # analogici
+                if info["type"] == "pm":
+
+                    if cycle % 5 == 0:
+
+                        poll_list.append(
+                            build_frame(
+                                "Q",
+                                mm,
+                                aa,
+                                "ME"
+                            )
+                        )
+
+                # allarmi
+                if info["type"] == "al":
+
+                    poll_list.append(
+                        build_frame(
+                            "Q",
+                            mm,
+                            aa,
+                            "AS"
+                        )
+                    )
+
+                    if cycle % 5 == 0:
+
+                        poll_list.append(
+                            build_frame(
+                                "Q",
+                                mm,
+                                aa,
+                                "LS"
+                            )
+                        )
+
+            for frame in poll_list:
+
+                tx_queue.put(frame)
+
+            cycle += 1
+
+            # IMPORTANTISSIMO:
+            # tutte le schede <5 sec
+            time.sleep(3)
+
+        except Exception as e:
+
+            print(f"Heartbeat error: {e}", flush=True)
+
+            time.sleep(2)
+
+# ============================================================
+# WATCHDOG
+# ============================================================
+
+def watchdog_thread():
+
+    while running:
+
+        now = time.time()
+
+        for board_id in BOARDS:
+
+            last = last_seen.get(board_id)
+
+            if last is None:
+                continue
+
+            delta = now - last
+
+            if delta > 10:
+
+                print(
+                    f"WARNING: {board_id} offline",
+                    flush=True
+                )
+
+        time.sleep(5)
+
+# ============================================================
+# SHUTDOWN
+# ============================================================
+
+def shutdown(sig=None, frame=None):
+
+    global running
+
+    print("Shutdown...", flush=True)
+
     running = False
-    ser.close()
+
+    try:
+        mqtt_client.loop_stop()
+    except:
+        pass
+
+    try:
+        mqtt_client.disconnect()
+    except:
+        pass
+
+    try:
+        ser.close()
+    except:
+        pass
+
+    sys.exit(0)
+
+# ============================================================
+# SIGNALS
+# ============================================================
+
+signal.signal(signal.SIGINT, shutdown)
+signal.signal(signal.SIGTERM, shutdown)
+
+# ============================================================
+# START THREADS
+# ============================================================
+
+threading.Thread(
+    target=tx_thread,
+    daemon=True
+).start()
+
+threading.Thread(
+    target=rx_thread,
+    daemon=True
+).start()
+
+threading.Thread(
+    target=heartbeat_thread,
+    daemon=True
+).start()
+
+threading.Thread(
+    target=watchdog_thread,
+    daemon=True
+).start()
+
+print("Bridge Tecnonautica avviato", flush=True)
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
+while running:
+
+    time.sleep(1)
+```
